@@ -1,3 +1,4 @@
+use crate::design::{self, ACCENT};
 use crate::{
     agent::Availability,
     app::{
@@ -49,6 +50,12 @@ pub struct Desktop {
     permission: bool,
     provider: String,
     ai_consent: bool,
+    session_tab: usize,
+    markdown_cache: egui_commonmark::CommonMarkCache,
+    #[cfg(not(windows))]
+    markdown_path: String,
+    speech_language: String,
+    speech_model: String,
     notes_edit: String,
     notes_dirty: bool,
     output: String,
@@ -94,9 +101,11 @@ pub fn run(state: app::State, runtime: tokio::runtime::Handle) -> anyhow::Result
 }
 impl Desktop {
     fn new(state: app::State, runtime: tokio::runtime::Handle, ctx: &egui::Context) -> Self {
+        design::install_fonts(ctx);
         ctx.set_theme(egui::ThemePreference::System);
         let recovery = runtime.block_on(desktop_api::recover(&state));
         let (sender, receiver) = mpsc::channel();
+        let speech = crate::transcription::SpeechSettings::load(&state.root);
         let mut result = Self {
             state,
             runtime,
@@ -112,6 +121,12 @@ impl Desktop {
             permission: false,
             provider: String::new(),
             ai_consent: false,
+            session_tab: 0,
+            markdown_cache: egui_commonmark::CommonMarkCache::default(),
+            #[cfg(not(windows))]
+            markdown_path: String::new(),
+            speech_language: speech.language,
+            speech_model: speech.model,
             notes_edit: String::new(),
             notes_dirty: false,
             output: String::new(),
@@ -156,7 +171,7 @@ impl Desktop {
         let ctx = ctx.clone();
         self.runtime.spawn(async move {
             let (speech, codex, claude) = tokio::join!(
-                state.transcriber.available(),
+                state.transcriber.available(&state.root),
                 state.agents.detect("codex"),
                 state.agents.detect("claude")
             );
@@ -214,6 +229,7 @@ impl Desktop {
         }
         self.stop_playback();
         self.view = view;
+        self.session_tab = 0;
         self.ai_consent = false;
         self.output.clear();
         if let View::Session(id) = view {
@@ -423,6 +439,9 @@ impl Desktop {
                                 self.notes_dirty = false;
                             }
                             self.notice = outcome.message;
+                            if self.notice == "Speech preferences saved" {
+                                self.check_tools(ctx);
+                            }
                             if let Some(file) = outcome.file {
                                 #[cfg(windows)]
                                 if outcome
@@ -494,6 +513,7 @@ impl Desktop {
     }
     fn render(&mut self, ctx: &egui::Context) {
         self.poll(ctx);
+        design::style(ctx);
         if ctx.input(|i| i.viewport().close_requested())
             && !self.closing
             && (self.recording() || self.notes_dirty || self.busy)
@@ -501,52 +521,61 @@ impl Desktop {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.close_confirm = true;
         }
+        let bg = if ctx.style().visuals.dark_mode {
+            egui::Color32::from_rgb(25, 27, 38)
+        } else {
+            egui::Color32::from_rgb(241, 242, 249)
+        };
         egui::SidePanel::left("library")
-            .resizable(true)
-            .default_width(245.0)
-            .min_width(190.0)
+            .resizable(false)
+            .exact_width(244.0)
+            .frame(egui::Frame::new().fill(bg).inner_margin(18.0))
             .show(ctx, |ui| {
-                ui.add_space(18.0);
-                ui.heading("OpenAIRecorder");
-                ui.label(egui::RichText::new("YOUR CONVERSATIONS").small().weak());
-                ui.add_space(20.0);
+                ui.add_space(10.0);
+                design::logo(ui);
+                ui.add_space(32.0);
                 if ui
                     .add_sized(
-                        [ui.available_width(), 34.0],
-                        egui::Button::new("+ New conversation"),
+                        [ui.available_width(), 42.0],
+                        design::primary("+  New recording"),
                     )
                     .clicked()
                 {
                     self.navigate(View::New);
                 }
-                if ui
-                    .selectable_label(
-                        self.view == View::Actions,
-                        format!(
-                            "Global actions ({})",
-                            self.data.actions.iter().filter(|g| !g.action.done).count()
-                        ),
-                    )
-                    .clicked()
+                ui.add_space(12.0);
+                if nav(ui, "Workspace", self.view == View::New).clicked() {
+                    self.navigate(View::New);
+                }
+                let open = self.data.actions.iter().filter(|g| !g.action.done).count();
+                if nav(
+                    ui,
+                    &format!("Global actions    {open}"),
+                    self.view == View::Actions,
+                )
+                .clicked()
                 {
                     self.navigate(View::Actions);
                 }
-                if ui
-                    .selectable_label(self.view == View::Settings, "Settings")
-                    .clicked()
-                {
+                if nav(ui, "Settings", self.view == View::Settings).clicked() {
                     self.navigate(View::Settings);
                 }
-                ui.separator();
-                ui.add(
+                ui.add_space(26.0);
+                design::eyebrow(ui, "YOUR LIBRARY");
+                ui.add_space(4.0);
+                ui.add_sized(
+                    [ui.available_width(), 36.0],
                     egui::TextEdit::singleline(&mut self.search)
-                        .hint_text("Search sessions & transcripts"),
+                        .hint_text("Search conversations…")
+                        .margin(egui::vec2(10.0, 9.0)),
                 );
-                ui.add_space(12.0);
+                ui.add_space(10.0);
                 let query = self.search.to_lowercase();
                 let mut selected = None;
+                let mut matches = 0;
                 egui::ScrollArea::vertical()
                     .id_salt("library-scroll")
+                    .max_height(ui.available_height() - 78.0)
                     .show(ui, |ui| {
                         for r in &self.data.sessions {
                             if !format!(
@@ -565,126 +594,380 @@ impl Desktop {
                             {
                                 continue;
                             }
-                            let label =
-                                format!("{}{}", if r.pinned { "[Pinned] " } else { "" }, r.title);
+                            matches += 1;
+                            let chosen = self.view == View::Session(r.id);
+                            let fill = if chosen {
+                                if ui.visuals().dark_mode {
+                                    egui::Color32::from_rgb(47, 39, 75)
+                                } else {
+                                    egui::Color32::from_rgb(230, 224, 251)
+                                }
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            };
+                            let label = format!(
+                                "{}{}\n{}",
+                                if r.pinned { "•  " } else { "" },
+                                short(&r.title, 25),
+                                date(&r.created_at)
+                            );
                             if ui
-                                .selectable_label(self.view == View::Session(r.id), label)
-                                .on_hover_text(&r.created_at)
+                                .add_sized(
+                                    [ui.available_width(), 58.0],
+                                    egui::Button::new(egui::RichText::new(label).size(13.0))
+                                        .fill(fill)
+                                        .stroke(egui::Stroke::NONE)
+                                        .corner_radius(9),
+                                )
+                                .on_hover_text(&r.title)
                                 .clicked()
                             {
                                 selected = Some(r.id);
                             }
-                            ui.label(egui::RichText::new(&r.status).small().weak());
-                            ui.add_space(8.0);
                         }
-                        if self.data.sessions.is_empty() {
-                            ui.weak("Your first conversation starts here.");
+                        if matches == 0 {
+                            design::subtitle(
+                                ui,
+                                if query.is_empty() {
+                                    "Your conversations will appear here."
+                                } else {
+                                    "No matching conversations."
+                                },
+                            );
                         }
                     });
                 if let Some(id) = selected {
                     self.navigate(View::Session(id));
                 }
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                    ui.add_space(8.0);
+                    design::subtitle(ui, "Your recordings. Your space.");
+                    design::pill(ui, "SAVED ON THIS COMPUTER", ACCENT);
+                });
             });
-        egui::TopBottomPanel::top("status").show(ctx, |ui| {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.weak("LOCAL FIRST  /  NATIVE DESKTOP");
-                if self.busy {
-                    ui.spinner();
-                }
-                if !self.notice.is_empty() {
-                    ui.label(&self.notice);
-                }
-            });
-            if self.recording() {
+        egui::TopBottomPanel::top("workspace-header")
+            .frame(
+                egui::Frame::new()
+                    .fill(ctx.style().visuals.panel_fill)
+                    .inner_margin(egui::Margin::symmetric(34, 18)),
+            )
+            .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    #[cfg(windows)]
-                    if let Some(c) = &self.capture {
-                        let s = c.clock.elapsed().as_secs();
-                        if !c.active.load(std::sync::atomic::Ordering::SeqCst) {
-                            ui.weak("Starting audio devices…");
+                    design::eyebrow(ui, "MY WORKSPACE");
+                    ui.label(egui::RichText::new("/").color(design::muted(ui)));
+                    ui.label(match self.view {
+                        View::New => "Overview",
+                        View::Session(_) => "Conversation",
+                        View::Actions => "Global actions",
+                        View::Settings => "Settings",
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.busy {
+                            ui.spinner();
+                            ui.label("Saving…");
+                        } else {
+                            design::pill(ui, "PRIVATE WORKSPACE", ACCENT);
                         }
-                        ui.colored_label(
-                            egui::Color32::from_rgb(205, 75, 65),
-                            format!(
-                                "{}  {:02}:{:02}",
-                                if c.paused.load(std::sync::atomic::Ordering::SeqCst) {
+                    });
+                });
+            });
+        if !self.notice.is_empty() {
+            egui::TopBottomPanel::bottom("notice")
+                .frame(
+                    egui::Frame::new()
+                        .fill(ctx.style().visuals.window_fill)
+                        .inner_margin(egui::Margin::symmetric(24, 10)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(&self.notice);
+                        if ui.small_button("Dismiss").clicked() {
+                            self.notice.clear();
+                        }
+                    });
+                });
+        }
+        if self.recording() {
+            egui::TopBottomPanel::bottom("recording-controls")
+                .frame(
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgb(36, 30, 62))
+                        .inner_margin(egui::Margin::symmetric(28, 16)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        #[cfg(windows)]
+                        if let Some(c) = &self.capture {
+                            let paused = c.paused.load(std::sync::atomic::Ordering::SeqCst);
+                            let s = c.clock.elapsed().as_secs();
+                            ui.label(
+                                egui::RichText::new(if paused {
                                     "PAUSED"
                                 } else {
-                                    "RECORDING"
-                                },
-                                s / 60,
-                                s % 60
-                            ),
-                        );
-                        ui.add(
-                            egui::ProgressBar::new(f32::from_bits(
-                                c.level.load(std::sync::atomic::Ordering::Relaxed),
-                            ))
-                            .desired_width(100.0),
-                        );
-                        let paused = c.paused.load(std::sync::atomic::Ordering::SeqCst);
-                        if ui
-                            .add_enabled(
-                                c.active.load(std::sync::atomic::Ordering::SeqCst),
-                                egui::Button::new(if paused { "Resume" } else { "Pause" }),
-                            )
-                            .clicked()
-                        {
-                            c.paused.store(!paused, std::sync::atomic::Ordering::SeqCst);
+                                    "● RECORDING"
+                                })
+                                .color(design::MINT)
+                                .strong(),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("{:02}:{:02}", s / 60, s % 60))
+                                    .color(egui::Color32::WHITE)
+                                    .size(24.0),
+                            );
+                            design::waveform(
+                                ui,
+                                egui::vec2(130.0, 36.0),
+                                Some(if paused {
+                                    0.0
+                                } else {
+                                    f32::from_bits(
+                                        c.level.load(std::sync::atomic::Ordering::Relaxed),
+                                    )
+                                }),
+                            );
+                            if ui
+                                .add_enabled(
+                                    c.active.load(std::sync::atomic::Ordering::SeqCst),
+                                    design::primary(if paused { "Resume" } else { "Pause" }),
+                                )
+                                .clicked()
+                            {
+                                c.paused.store(!paused, std::sync::atomic::Ordering::SeqCst);
+                            }
                         }
-                    }
-                    if ui.button("Stop & save").clicked() {
-                        self.stop_capture();
-                    }
+                        if ui.button("Stop & save").clicked() {
+                            self.stop_capture();
+                        }
+                    });
                 });
-            }
-            ui.add_space(8.0);
-        });
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(16.0);
-            egui::ScrollArea::vertical()
-                .id_salt("content-scroll")
-                .show(ui, |ui| match self.view {
-                    View::New => self.new_view(ui, ctx),
-                    View::Session(id) => self.session_view(ui, ctx, id),
-                    View::Actions => self.actions_view(ui, ctx),
-                    View::Settings => self.settings_view(ui, ctx),
-                });
-        });
+        }
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(ctx.style().visuals.panel_fill)
+                    .inner_margin(egui::Margin::symmetric(34, 26)),
+            )
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("content-scroll")
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        match self.view {
+                            View::New => self.new_view(ui, ctx),
+                            View::Session(id) => self.session_view(ui, ctx, id),
+                            View::Actions => self.actions_view(ui, ctx),
+                            View::Settings => self.settings_view(ui, ctx),
+                        }
+                        ui.add_space(24.0);
+                    });
+            });
         self.dialogs(ctx);
         ctx.request_repaint_after(Duration::from_millis(100));
     }
     fn new_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.heading(egui::RichText::new("Be present. Keep the important parts.").size(30.0));
         ui.label(
-            "Capture the conversation on your computer, then let your signed-in agent take notes.",
+            egui::RichText::new("Make room for the conversation.")
+                .size(34.0)
+                .strong(),
+        );
+        design::subtitle(
+            ui,
+            "Capture the moment. Keep the notes, decisions, and next steps together.",
         );
         ui.add_space(24.0);
-        egui::Frame::group(ui.style()).inner_margin(20.0).show(ui,|ui|{
-            ui.heading("New conversation");ui.add_space(12.0);ui.label("Conversation name");ui.add(egui::TextEdit::singleline(&mut self.title).hint_text("Monday product sync").desired_width(f32::INFINITY));
-            ui.add_space(12.0);ui.checkbox(&mut self.system_audio,"Capture meeting/system audio");ui.checkbox(&mut self.mic,"Include microphone");
-            ui.weak("Meeting audio uses your Windows default playback device (speakers/headphones). Make sure Teams, Slack, or Zoom uses that device. Use headphones to reduce echo.");
-            ui.add_space(12.0);ui.checkbox(&mut self.permission,"I have informed the participants and have permission to record.");
-            ui.add_space(12.0);
-            if ui.add_enabled(cfg!(windows)&&self.permission&&(self.system_audio||self.mic)&&!self.recording()&&!self.busy,egui::Button::new("Start recording").min_size(egui::vec2(160.0,35.0))).clicked(){self.begin_capture(ctx);}
-            ui.weak("A movable, always-on-top recording widget appears when capture starts. You can minimize this window; recording and its Stop button continue working.");
-            #[cfg(not(windows))] ui.weak("Linux desktop preview: native audio capture is Windows-only.");
-        });
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgb(39, 31, 66))
+            .corner_radius(18)
+            .inner_margin(26.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("A LITTLE MORE PRESENCE")
+                                .size(11.0)
+                                .color(design::MINT)
+                                .strong(),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new("Listen now. Revisit later.")
+                                .size(25.0)
+                                .color(egui::Color32::WHITE)
+                                .strong(),
+                        );
+                        ui.label(
+                            egui::RichText::new("One place for every conversation.")
+                                .size(14.0)
+                                .color(egui::Color32::from_rgb(190, 183, 213)),
+                        );
+                    });
+                    if ui.available_width() > 140.0 {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            design::waveform(
+                                ui,
+                                egui::vec2(ui.available_width().min(210.0), 68.0),
+                                None,
+                            )
+                        });
+                    }
+                });
+            });
         ui.add_space(20.0);
-        ui.heading("Already have a recording?");
-        ui.label("Import an audio or video file up to 150 MB.");
-        #[cfg(not(windows))]
-        ui.add(
-            egui::TextEdit::singleline(&mut self.import_path)
-                .hint_text("Full file path (Linux preview)"),
-        );
-        if ui
-            .add_enabled(!self.busy, egui::Button::new("Import recording…"))
-            .clicked()
-        {
-            self.import(ctx);
+        design::card(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.heading("Start a recording");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    design::pill(ui, "AUDIO ONLY", ACCENT)
+                });
+            });
+            ui.add_space(8.0);
+            design::eyebrow(ui, "CONVERSATION NAME");
+            ui.add_sized(
+                [ui.available_width(), 42.0],
+                egui::TextEdit::singleline(&mut self.title)
+                    .hint_text("e.g. Weekly team sync")
+                    .margin(egui::vec2(12.0, 11.0)),
+            );
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut self.system_audio, "Meeting audio");
+                ui.add_space(14.0);
+                ui.checkbox(&mut self.mic, "Microphone");
+            });
+            design::subtitle(
+                ui,
+                "Teams, Zoom, Slack, and other audio playing through your default Windows output.",
+            );
+            ui.checkbox(
+                &mut self.permission,
+                "Everyone in this conversation knows I'm recording.",
+            );
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(
+                        cfg!(windows)
+                            && self.permission
+                            && (self.system_audio || self.mic)
+                            && !self.recording()
+                            && !self.busy,
+                        design::primary("●  Start recording").min_size(egui::vec2(175.0, 42.0)),
+                    )
+                    .clicked()
+                {
+                    self.begin_capture(ctx);
+                }
+                design::subtitle(ui, "Pause anytime. Floating controls stay within reach.");
+            });
+            #[cfg(not(windows))]
+            design::subtitle(
+                ui,
+                "Desktop preview · Recording is available in the Windows build.",
+            );
+        });
+        ui.add_space(18.0);
+        ui.horizontal_wrapped(|ui| {
+            design::subtitle(ui, "Already recorded it?");
+            if ui
+                .add_enabled(!self.busy, egui::Button::new("Import audio…"))
+                .clicked()
+            {
+                self.import(ctx);
+            }
+            #[cfg(not(windows))]
+            ui.add(
+                egui::TextEdit::singleline(&mut self.import_path)
+                    .hint_text("Audio path for preview")
+                    .desired_width(240.0),
+            );
+        });
+        ui.add_space(24.0);
+        ui.horizontal(|ui| {
+            ui.heading("Recent conversations");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                design::subtitle(ui, &format!("{} sessions", self.data.sessions.len()))
+            });
+        });
+        ui.add_space(8.0);
+        let sessions = self.data.sessions.clone();
+        if sessions.is_empty() {
+            design::card(ui).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.add_space(12.0);
+                ui.strong("Your next conversation belongs here.");
+                design::subtitle(
+                    ui,
+                    "Start a recording or import audio to create your first session.",
+                );
+                ui.add_space(12.0);
+            });
+        } else {
+            let columns = if ui.available_width() > 700.0 { 2 } else { 1 };
+            let width = (ui.available_width() - 14.0 * (columns - 1) as f32) / columns as f32;
+            egui::Grid::new("recent-grid")
+                .num_columns(columns)
+                .spacing(egui::vec2(14.0, 14.0))
+                .show(ui, |ui| {
+                    for (i, r) in sessions.iter().take(8).enumerate() {
+                        design::card(ui).show(ui, |ui| {
+                            ui.set_width((width - 44.0).max(120.0));
+                            design::eyebrow(
+                                ui,
+                                &format!(
+                                    "{}{}",
+                                    if r.pinned { "PINNED  ·  " } else { "" },
+                                    date(&r.created_at)
+                                ),
+                            );
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(&r.title).size(18.0).strong(),
+                                    )
+                                    .frame(false),
+                                )
+                                .clicked()
+                            {
+                                self.navigate(View::Session(r.id));
+                            }
+                            let open = r.actions.iter().filter(|a| !a.done).count();
+                            design::subtitle(
+                                ui,
+                                &format!(
+                                    "{}  ·  {open} open actions",
+                                    if r.notes.is_empty() {
+                                        "Recording saved"
+                                    } else {
+                                        "Notes ready"
+                                    }
+                                ),
+                            );
+                        });
+                        if (i + 1) % columns == 0 {
+                            ui.end_row();
+                        }
+                    }
+                });
         }
+    }
+    fn import_markdown(&mut self, id: Uuid, ctx: &egui::Context) {
+        #[cfg(windows)]
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Markdown", &["md", "markdown", "txt"])
+            .pick_file()
+        {
+            self.dispatch(Command::ImportMarkdown { id, path }, ctx);
+        }
+        #[cfg(not(windows))]
+        self.dispatch(
+            Command::ImportMarkdown {
+                id,
+                path: std::path::PathBuf::from(self.markdown_path.trim()),
+            },
+            ctx,
+        );
     }
     fn session_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, id: Uuid) {
         let Some(r) = self.data.sessions.iter().find(|r| r.id == id).cloned() else {
@@ -692,17 +975,13 @@ impl Desktop {
             return;
         };
         let busy = self.busy || r.status == "processing";
+        design::eyebrow(ui, &date(&r.created_at));
         ui.horizontal_wrapped(|ui| {
-            ui.heading(&r.title);
-            ui.weak(&r.status);
+            ui.label(egui::RichText::new(&r.title).size(32.0).strong());
             if ui
                 .add_enabled(
                     !busy,
-                    egui::Button::new(if r.pinned {
-                        "Unpin session"
-                    } else {
-                        "Pin session"
-                    }),
+                    egui::Button::new(if r.pinned { "Unpin" } else { "Pin" }),
                 )
                 .clicked()
             {
@@ -715,345 +994,436 @@ impl Desktop {
                 );
             }
         });
-        ui.weak(&r.created_at);
-        if let Some(error) = &r.error {
-            ui.colored_label(egui::Color32::from_rgb(205, 90, 75), error);
-        }
-        #[cfg(windows)]
-        if !self.recording_warning.is_empty() {
-            ui.colored_label(
-                egui::Color32::from_rgb(205, 140, 70),
-                &self.recording_warning,
-            );
-        }
-        ui.add_space(12.0);
         ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(
-                    !busy && !self.recording() && cfg!(windows),
-                    egui::Button::new("Play recording"),
-                )
-                .clicked()
-            {
-                self.stop_playback();
-                self.dispatch(Command::Playback(id), ctx);
+            design::pill(
+                ui,
+                if r.status == "processing" {
+                    "PROCESSING"
+                } else if r.notes.is_empty() {
+                    "RECORDING SAVED"
+                } else {
+                    "NOTES READY"
+                },
+                ACCENT,
+            );
+            design::subtitle(
+                ui,
+                &format!(
+                    "{} action items · {} completed",
+                    r.actions.len(),
+                    r.actions.iter().filter(|a| a.done).count()
+                ),
+            );
+        });
+        if let Some(error) = &r.error {
+            ui.colored_label(egui::Color32::from_rgb(207, 92, 104), error);
+        }
+        ui.add_space(18.0);
+        design::card(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(
+                        !busy && self.tools.speech,
+                        design::primary(if r.transcript.is_empty() {
+                            "Create transcript"
+                        } else {
+                            "Refresh transcript"
+                        }),
+                    )
+                    .clicked()
+                {
+                    self.dispatch(Command::Transcribe(id), ctx);
+                }
+                if ui
+                    .add_enabled(
+                        !busy && cfg!(windows) && !self.recording(),
+                        egui::Button::new("Play audio"),
+                    )
+                    .clicked()
+                {
+                    self.stop_playback();
+                    self.dispatch(Command::Playback(id), ctx);
+                }
+                #[cfg(windows)]
+                if self.player.is_some() && ui.button("Stop playback").clicked() {
+                    self.stop_playback();
+                }
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Import Markdown…"))
+                    .clicked()
+                {
+                    self.import_markdown(id, ctx);
+                }
+                if ui.button("Export notes…").clicked() {
+                    self.export(id, true, ctx);
+                }
+            });
+            #[cfg(not(windows))]
+            ui.add(
+                egui::TextEdit::singleline(&mut self.markdown_path)
+                    .hint_text("Returned Markdown path (preview)"),
+            );
+            if !self.tools.speech {
+                design::subtitle(
+                    ui,
+                    "Speech engine is not ready. Check Settings for its status.",
+                );
             }
-            if ui.button("Stop playback").clicked() {
-                self.stop_playback();
+            if busy {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    design::subtitle(ui, "Working on this conversation…");
+                });
             }
-            if ui
-                .add_enabled(
-                    !busy && self.tools.speech,
-                    egui::Button::new("Generate local transcript"),
-                )
-                .clicked()
-            {
-                self.dispatch(Command::Transcribe(id), ctx);
+        });
+        ui.add_space(18.0);
+        ui.horizontal_wrapped(|ui| {
+            for (i, label) in [
+                (0, "Overview"),
+                (1, "Actions"),
+                (2, "Transcript"),
+                (3, "Audio & AI"),
+            ] {
+                if nav(ui, label, self.session_tab == i).clicked() {
+                    self.session_tab = i;
+                }
             }
+        });
+        ui.add_space(12.0);
+        match self.session_tab {
+            0 => {
+                let side = ui.available_width() > 790.0;
+                if side {
+                    let width = ui.available_width() - 306.0;
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(width, 0.0),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| self.notes_panel(ui, ctx, &r, busy),
+                        );
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(296.0, 0.0),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                self.session_actions(ui, ctx, &r, busy);
+                            },
+                        );
+                    });
+                } else {
+                    self.notes_panel(ui, ctx, &r, busy);
+                    ui.add_space(18.0);
+                    self.session_actions(ui, ctx, &r, busy);
+                }
+            }
+            1 => self.session_actions(ui, ctx, &r, busy),
+            2 => {
+                design::card(ui).show(ui,|ui|{ui.set_width(ui.available_width());ui.heading("Full transcript");ui.add_space(8.0);if r.transcript.is_empty(){design::subtitle(ui,"Create a transcript or import a Markdown document with a Full transcript section.");}else{egui_commonmark::CommonMarkViewer::new().show(ui,&mut self.markdown_cache,&r.transcript);ui.add_space(12.0);if ui.button("Copy transcript").clicked(){ctx.copy_text(r.transcript.clone());}
+if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
+            }
+            _ => self.audio_ai_panel(ui, ctx, &r, busy),
+        }
+        ui.add_space(20.0);
+        egui::CollapsingHeader::new("Session options").show(ui, |ui| {
             if ui
-                .add_enabled(!busy, egui::Button::new("Delete session…"))
+                .add_enabled(!busy, egui::Button::new("Delete conversation…"))
                 .clicked()
             {
                 self.delete_confirm = Some(id);
             }
         });
-        if !self.tools.speech {
-            ui.weak(
-                "Local speech tools are not ready. See Settings for installation instructions.",
-            );
-        }
-        ui.separator();
-        ui.heading("Notes & decisions");
-        if r.notes.is_empty() {
-            ui.weak("Run your agent to generate notes.");
-        } else {
-            markdown(ui, &r.notes);
-        }
-        egui::CollapsingHeader::new("Edit notes").show(ui, |ui| {
-            self.notes_dirty |= ui
-                .add(
-                    egui::TextEdit::multiline(&mut self.notes_edit)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(12),
-                )
-                .changed();
-            if ui
-                .add_enabled(!busy && self.notes_dirty, egui::Button::new("Save notes"))
-                .clicked()
-            {
-                self.dispatch(
-                    Command::Notes {
-                        id,
-                        notes: self.notes_edit.clone(),
-                    },
-                    ctx,
-                );
-                self.notes_save_pending = true;
+    }
+    fn notes_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        r: &app::Recording,
+        busy: bool,
+    ) {
+        design::card(ui).show(ui,|ui|{
+            ui.set_width(ui.available_width());
+            ui.heading("Notes & decisions");ui.add_space(12.0);
+            if r.notes.is_empty(){
+                ui.add_space(12.0);ui.label(egui::RichText::new("From conversation to clarity.").size(21.0).strong());
+                design::subtitle(ui,"Create a transcript, then let your signed-in agent turn it into notes and next steps.");
+                if ui.add(design::primary("Set up AI notes")).clicked(){self.session_tab=3;}
+                ui.add_space(16.0);
+            }else{
+                let mut document=r.notes.clone();
+                let response=egui_commonmark::CommonMarkViewer::new().show_mut(ui,&mut self.markdown_cache,&mut document);
+                if response.response.changed()&&!busy{self.dispatch(Command::Notes{id:r.id,notes:document},ctx);}
             }
-        });
-        if ui.button("Export notes as Markdown…").clicked() {
-            self.export(id, true, ctx);
-        }
-        ui.separator();
-        ui.heading("Session action items");
-        for action in &r.actions {
-            ui.horizontal_wrapped(|ui| {
-                let mut done = action.done;
-                if ui
-                    .add_enabled(!busy, egui::Checkbox::new(&mut done, &action.title))
-                    .changed()
-                {
-                    self.dispatch(
-                        Command::Complete {
-                            id,
-                            action: action.id,
-                            done,
-                        },
-                        ctx,
-                    );
-                }
-                let copied = self
-                    .data
-                    .actions
-                    .iter()
-                    .any(|g| g.source_session == id && g.source_action == action.id);
-                if ui
-                    .add_enabled(
-                        !self.busy && !copied,
-                        egui::Button::new(if copied {
-                            "Copied"
-                        } else {
-                            "Copy to global actions"
-                        }),
-                    )
-                    .clicked()
-                {
-                    self.dispatch(
-                        Command::Copy {
-                            id,
-                            action: action.id,
-                        },
-                        ctx,
-                    );
-                }
+            ui.add_space(12.0);
+            egui::CollapsingHeader::new("Edit Markdown").show(ui,|ui|{
+                self.notes_dirty|=ui.add(egui::TextEdit::multiline(&mut self.notes_edit).desired_width(f32::INFINITY).desired_rows(14).font(egui::TextStyle::Monospace)).changed();
+                if ui.add_enabled(!busy&&self.notes_dirty,design::primary("Save changes")).clicked(){self.dispatch(Command::Notes{id:r.id,notes:self.notes_edit.clone()},ctx);self.notes_save_pending=true;}
             });
-            ui.weak(format!(
-                "Owner: {}  |  Due: {}",
-                action.owner.as_deref().unwrap_or("unspecified"),
-                action.due.as_deref().unwrap_or("unspecified")
-            ));
-        }
-        if r.actions.is_empty() {
-            ui.weak("Your agent will extract action items here.");
-        }
-        ui.separator();
-        ui.heading("Your subscription agent");
-        self.agent_options(ui);
-        ui.checkbox(
-            &mut self.ai_consent,
-            "Send this transcript to my selected agent using my signed-in account.",
-        );
-        let installed = match self.provider.as_str() {
-            "codex" => self.tools.codex.installed,
-            "claude" => self.tools.claude.installed,
-            _ => false,
-        };
-        if ui
-            .add_enabled(
-                !busy
-                    && installed
-                    && !r.transcript.is_empty()
-                    && self.ai_consent
-                    && !self.notes_dirty,
-                egui::Button::new("Generate notes & actions"),
-            )
-            .clicked()
-        {
-            self.dispatch(
-                Command::Generate {
-                    id,
-                    provider: self.provider.clone(),
-                    consent: true,
-                },
-                ctx,
-            );
-        }
-        ui.weak("Uses your CLI subscription sign-in and its usage limits. Raw audio stays on your computer. Installation and sign-in instructions are in Settings.");
-        egui::CollapsingHeader::new("Agent output & diagnostics").show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .max_height(250.0)
-                .id_salt("agent-log")
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.output)
-                            .code_editor()
-                            .desired_width(f32::INFINITY)
-                            .interactive(false),
-                    );
-                });
-        });
-        ui.separator();
-        egui::CollapsingHeader::new("Full transcript").show(ui, |ui| {
-            if r.transcript.is_empty() {
-                ui.weak("Generate a local transcript first.");
-            } else {
-                ui.label(&r.transcript);
-            }
-            if ui.button("Copy transcript").clicked() {
-                ctx.copy_text(r.transcript.clone());
-            }
-            if ui.button("Export transcript…").clicked() {
-                self.export(id, false, ctx);
-            }
         });
     }
-    fn agent_options(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.add_enabled(
-                self.tools.codex.installed,
-                egui::RadioButton::new(self.provider == "codex", "Codex / ChatGPT"),
-            )
-            .clicked()
-            .then(|| self.provider = "codex".into());
-            ui.add_enabled(
-                self.tools.claude.installed,
-                egui::RadioButton::new(self.provider == "claude", "Claude Code"),
-            )
-            .clicked()
-            .then(|| self.provider = "claude".into());
+    fn session_actions(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        r: &app::Recording,
+        busy: bool,
+    ) {
+        design::card(ui).show(ui,|ui|{
+            ui.set_width(ui.available_width());ui.heading("Next steps");
+            let total=r.actions.len();let done=r.actions.iter().filter(|a|a.done).count();
+            design::subtitle(ui,&format!("{done} of {total} complete"));
+            if total>0{ui.add(egui::ProgressBar::new(done as f32/total as f32).fill(ACCENT).desired_height(4.0));}
+            ui.add_space(8.0);
+            for a in &r.actions{
+                let mut checked=a.done;
+                let text=if a.done{egui::RichText::new(&a.title).strikethrough().color(design::muted(ui))}else{egui::RichText::new(&a.title)};
+                if ui.add_enabled(!busy,egui::Checkbox::new(&mut checked,text)).changed(){self.dispatch(Command::Complete{id:r.id,action:a.id,done:checked},ctx);}
+                if let Some(owner)=&a.owner{design::subtitle(ui,owner);}
+                if let Some(due)=&a.due{design::subtitle(ui,&format!("Due {due}"));}
+                let copied=self.data.actions.iter().any(|g|g.source_session==r.id&&g.source_action==a.id);
+                if !a.done&&ui.add_enabled(!busy&&!copied,egui::Button::new(if copied{"Added to global"}else{"+ Add to global"}).small()).clicked(){self.dispatch(Command::Copy{id:r.id,action:a.id},ctx);}
+                ui.add_space(8.0);ui.separator();ui.add_space(4.0);
+            }
+            if total==0{ui.add_space(12.0);design::subtitle(ui,"Action items will appear here when notes are ready. Imported Markdown checkboxes become actions too.");}
         });
+    }
+    fn audio_ai_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        r: &app::Recording,
+        busy: bool,
+    ) {
+        design::card(ui).show(ui,|ui|{
+            ui.set_width(ui.available_width());design::eyebrow(ui,"YOUR SUBSCRIPTION");ui.heading("Turn the transcript into notes");
+            design::subtitle(ui,"Whisper handles speech locally. Your chosen agent receives the transcript when you generate notes.");
+            ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui|{
+                for (key,label,installed) in [("codex","Codex / ChatGPT",self.tools.codex.installed),("claude","Claude Code",self.tools.claude.installed)]{
+                    if ui.add_enabled(installed,egui::Button::new(label).selected(self.provider==key)).clicked(){self.provider=key.into();}
+                }
+            });
+            if !self.tools.codex.installed&&!self.tools.claude.installed{design::subtitle(ui,"No subscription agent detected. Settings links to the official installers.");}
+            ui.checkbox(&mut self.ai_consent,"Share this transcript with my selected agent.");
+            if ui.add_enabled(!busy&&!r.transcript.is_empty()&&!self.provider.is_empty()&&self.ai_consent,design::primary("Generate notes & actions")).clicked(){self.dispatch(Command::Generate{id:r.id,provider:self.provider.clone(),consent:true},ctx);}
+            if r.transcript.is_empty(){design::subtitle(ui,"Create a transcript first.");}
+            ui.add_space(12.0);
+            egui::CollapsingHeader::new("Agent activity").show(ui,|ui|{
+                if self.output.trim().is_empty(){design::subtitle(ui,"Agent output will appear here.");}else{let mut text=self.output.as_str();ui.add(egui::TextEdit::multiline(&mut text).desired_width(f32::INFINITY).desired_rows(12).font(egui::TextStyle::Monospace));}
+            });
+        });
+        ui.add_space(18.0);
+        design::card(ui).show(ui,|ui|{
+            ui.set_width(ui.available_width());ui.heading("Use another audio service");
+            design::subtitle(ui,"Export the original audio and a ready-to-copy prompt. Use a service with audio support, then bring its Markdown back here.");
+            ui.horizontal_wrapped(|ui|{
+                if ui.add_enabled(!busy,egui::Button::new("Prepare audio folder")).clicked(){self.dispatch(Command::PrepareAudio(r.id),ctx);}
+                if ui.button("Open audio folder").clicked(){self.open_folder(self.state.root.join(r.id.to_string()).join("audio-handoff"));}
+                if ui.button("Copy audio prompt").clicked(){ctx.copy_text(crate::document::audio_prompt().into());}
+            });
+            design::subtitle(ui,"Codex CLI and Claude Code do not accept audio attachments directly.");
+            if ui.add_enabled(!busy,egui::Button::new("Import returned Markdown…")).clicked(){self.import_markdown(r.id,ctx);}
+            design::subtitle(ui,"Or save agent-output.md in this session's folder; the app imports changes automatically.");
+            if ui.small_button("Open session folder").clicked(){self.open_folder(self.state.root.join(r.id.to_string()));}
+        });
+    }
+    fn open_folder(&mut self, path: std::path::PathBuf) {
+        if !path.is_dir() {
+            self.notice = "Prepare the audio folder first.".into();
+            return;
+        }
+        #[cfg(windows)]
+        {
+            let mut c = std::process::Command::new("explorer.exe");
+            use std::os::windows::process::CommandExt;
+            c.creation_flags(0x08000000);
+            if let Err(e) = c.arg(&path).spawn() {
+                self.notice = format!("Cannot open folder: {e}");
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            self.notice = format!("Folder: {}", path.display());
+        }
     }
     fn actions_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.heading("Your global actions");
-        ui.label("Copied actions retain their source and survive session deletion. Completion is independent of the session checklist.");
-        ui.checkbox(&mut self.hide_completed, "Hide completed");
-        ui.separator();
+        design::eyebrow(ui, "ALL YOUR CONVERSATIONS");
+        ui.label(
+            egui::RichText::new("A little less on your mind.")
+                .size(34.0)
+                .strong(),
+        );
+        design::subtitle(
+            ui,
+            "One list for the next steps that matter. Each action keeps a link to its conversation.",
+        );
+        ui.add_space(24.0);
+        let total = self.data.actions.len();
+        let done = self.data.actions.iter().filter(|a| a.action.done).count();
+        ui.horizontal_wrapped(|ui| {
+            design::pill(ui, &format!("{} OPEN", total - done), ACCENT);
+            design::pill(
+                ui,
+                &format!("{done} COMPLETE"),
+                egui::Color32::from_rgb(49, 158, 125),
+            );
+            ui.checkbox(&mut self.hide_completed, "Hide completed");
+        });
+        ui.add_space(18.0);
         let actions = self.data.actions.clone();
-        for global in actions {
-            if self.hide_completed && global.action.done {
+        for g in &actions {
+            if self.hide_completed && g.action.done {
                 continue;
             }
-            ui.horizontal_wrapped(|ui| {
-                let mut done = global.action.done;
-                if ui
-                    .add_enabled(
-                        !self.busy,
-                        egui::Checkbox::new(&mut done, &global.action.title),
-                    )
-                    .changed()
-                {
-                    self.dispatch(
-                        Command::GlobalComplete {
-                            id: global.id,
-                            done,
-                        },
-                        ctx,
-                    );
-                }
-                if ui
-                    .add_enabled(!self.busy, egui::Button::new("Remove"))
-                    .clicked()
-                {
-                    self.dispatch(Command::GlobalRemove(global.id), ctx);
-                }
+            design::card(ui).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    let mut checked = g.action.done;
+                    let text = if checked {
+                        egui::RichText::new(&g.action.title)
+                            .size(17.0)
+                            .strikethrough()
+                            .color(design::muted(ui))
+                    } else {
+                        egui::RichText::new(&g.action.title).size(17.0)
+                    };
+                    if ui
+                        .add_enabled(!self.busy, egui::Checkbox::new(&mut checked, text))
+                        .changed()
+                    {
+                        self.dispatch(
+                            Command::GlobalComplete {
+                                id: g.id,
+                                done: checked,
+                            },
+                            ctx,
+                        );
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if self.data.sessions.iter().any(|r| r.id == g.source_session) {
+                        if ui.link(&g.source_title).clicked() {
+                            self.navigate(View::Session(g.source_session));
+                        }
+                    } else {
+                        design::subtitle(ui, &format!("{} · archived source", g.source_title));
+                    }
+                    if let Some(owner) = &g.action.owner {
+                        design::subtitle(ui, owner);
+                    }
+                    if let Some(due) = &g.action.due {
+                        design::subtitle(ui, &format!("Due {due}"));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(!self.busy, egui::Button::new("Remove").small())
+                            .clicked()
+                        {
+                            self.dispatch(Command::GlobalRemove(g.id), ctx);
+                        }
+                    });
+                });
             });
-            ui.weak(format!(
-                "Owner: {}  |  Due: {}",
-                global.action.owner.as_deref().unwrap_or("unspecified"),
-                global.action.due.as_deref().unwrap_or("unspecified")
-            ));
-            if self
-                .data
-                .sessions
-                .iter()
-                .any(|r| r.id == global.source_session)
-            {
-                if ui.link(format!("From: {}", global.source_title)).clicked() {
-                    self.navigate(View::Session(global.source_session));
-                }
-            } else {
-                ui.weak(format!("From: {} (session deleted)", global.source_title));
-            }
-            ui.separator();
+            ui.add_space(10.0);
         }
-        if self.data.actions.is_empty() {
-            ui.weak("Copy actions from a session to manage them here.");
+        if actions.is_empty() {
+            design::card(ui).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.add_space(24.0);
+                ui.heading("Your next steps, all together.");
+                design::subtitle(
+                    ui,
+                    "Open a conversation and add its open action items to this list.",
+                );
+                ui.add_space(24.0);
+            });
+        } else if self.hide_completed && total == done {
+            design::subtitle(ui, "Everything is checked off. Enjoy the clear list.");
         }
     }
     fn settings_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.heading("Settings");
-        ui.add_space(12.0);
-        ui.heading("Appearance");
-        ui.label("System follows your computer's appearance, including changes while the app is running.");
-        ui.horizontal(|ui| {
-            for (key, name) in [("light", "Light"), ("dark", "Dark"), ("system", "System")] {
-                if ui
-                    .add_enabled(!self.busy, egui::RadioButton::new(self.theme == key, name))
-                    .clicked()
-                {
-                    self.theme = key.into();
-                    Self::theme(ctx, key);
-                    self.dispatch(Command::Theme(key.into()), ctx);
+        ui.label(
+            egui::RichText::new("Make this space yours.")
+                .size(34.0)
+                .strong(),
+        );
+        design::subtitle(
+            ui,
+            "Appearance, speech recognition, and your connected tools.",
+        );
+        ui.add_space(24.0);
+        design::card(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.heading("Appearance");
+            design::subtitle(ui, "Choose your preferred light, or follow your computer.");
+            ui.add_space(12.0);
+            ui.horizontal_wrapped(|ui| {
+                for (key, name) in [("light", "Light"), ("dark", "Dark"), ("system", "System")] {
+                    if ui
+                        .add_enabled(
+                            !self.busy,
+                            egui::Button::new(name)
+                                .selected(self.theme == key)
+                                .min_size(egui::vec2(120.0, 48.0)),
+                        )
+                        .clicked()
+                    {
+                        self.theme = key.into();
+                        Self::theme(ctx, key);
+                        self.dispatch(Command::Theme(key.into()), ctx);
+                    }
                 }
+            });
+        });
+        ui.add_space(18.0);
+        design::card(ui).show(ui,|ui|{
+            ui.set_width(ui.available_width());ui.heading("Speech recognition");
+            design::pill(ui,if !self.tools.checked{"CHECKING"}else if self.tools.speech{"WHISPER READY"}else{"NOT READY"},ACCENT);
+            design::subtitle(ui,"Speech is processed on your computer. Set Bulgarian explicitly for Bulgarian conversations.");
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui|{
+                for (key,name) in [("bg","Bulgarian"),("en","English"),("auto","Auto-detect")]{
+                    if ui.add_enabled(!self.busy,egui::Button::new(name).selected(self.speech_language==key)).clicked(){self.speech_language=key.into();self.save_speech_settings(ctx);}
+                }
+            });
+            design::subtitle(ui,"The bundled tiny model favors speed. A multilingual small or medium model can improve Bulgarian accuracy.");
+            #[cfg(windows)] if ui.button("Choose a Whisper model…").clicked() && let Some(path)=rfd::FileDialog::new().add_filter("Whisper model",&["bin"]).pick_file(){self.speech_model=path.display().to_string();self.save_speech_settings(ctx);}
+            if !self.speech_model.is_empty(){design::subtitle(ui,&self.speech_model);if ui.button("Use bundled model").clicked(){self.speech_model.clear();self.save_speech_settings(ctx);}}
+            if ui.link("Download multilingual models").clicked(){ctx.open_url(egui::OpenUrl::new_tab("https://huggingface.co/ggerganov/whisper.cpp/tree/main"));}
+        });
+        ui.add_space(18.0);
+        design::card(ui).show(ui,|ui|{
+            ui.set_width(ui.available_width());ui.heading("Subscription agents");design::subtitle(ui,"Connect an installed agent using its own subscription login. No API keys are required here.");ui.add_space(10.0);
+            for (name,info,url) in [("Codex / ChatGPT",&self.tools.codex,"https://developers.openai.com/codex/cli/"),("Claude Code",&self.tools.claude,"https://code.claude.com/docs/en/setup")]{
+                ui.horizontal_wrapped(|ui|{ui.strong(name);design::pill(ui,if info.installed{"DETECTED"}else{"NOT INSTALLED"},if info.installed{egui::Color32::from_rgb(49,158,125)}else{design::muted(ui)});if ui.link("Official setup guide").clicked(){ctx.open_url(egui::OpenUrl::new_tab(url));}});
+                if let Some(version)=&info.version{design::subtitle(ui,version);}
+                ui.add_space(8.0);
+            }
+            if ui.button("Check tools again").clicked(){self.check_tools(ctx);}
+        });
+        ui.add_space(18.0);
+        design::card(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.heading("Your data");
+            design::subtitle(
+                ui,
+                "Recordings, Markdown, and action lists stay in your local workspace.",
+            );
+            ui.label(self.state.root.display().to_string());
+            if ui.button("Open data folder").clicked() {
+                self.open_folder(self.state.root.clone());
             }
         });
-        ui.separator();
-        ui.heading("Local transcription");
-        ui.label(if !self.tools.checked {
-            "Checking tools…"
-        } else if self.tools.speech {
-            "Whisper, its speech model, and ffmpeg are ready."
-        } else {
-            "Local speech tools need setup."
-        });
-        ui.weak("The Windows ZIP includes Whisper and the speech model. Install ffmpeg and the Visual C++ runtime if they are missing:");
-        for command in [
-            "winget install --id Gyan.FFmpeg --exact",
-            "winget install --id Microsoft.VCRedist.2015+.x64 --exact",
-        ] {
-            copy_command(ui, ctx, command);
-        }
-        ui.separator();
-        ui.heading("Subscription agents");
-        for (name, info, install, login) in [
-            (
-                "Codex",
-                &self.tools.codex,
-                "npm install -g @openai/codex",
-                "codex login",
-            ),
-            (
-                "Claude Code",
-                &self.tools.claude,
-                "winget install --id Anthropic.ClaudeCode --exact",
-                "claude auth login",
-            ),
-        ] {
-            ui.strong(format!(
-                "{name}: {}",
-                if info.installed {
-                    "Detected"
-                } else {
-                    "Not detected"
-                }
-            ));
-            if let Some(version) = &info.version {
-                ui.weak(version);
-            }
-            if !info.installed {
-                copy_command(ui, ctx, install);
-            }
-            copy_command(ui, ctx, login);
-        }
-        ui.weak("Restart the app after installing tools so it receives the updated PATH. Detection confirms installation; subscription sign-in and quota are checked when notes are generated.");
-        if ui.button("Recheck installed tools").clicked() {
-            self.check_tools(ctx);
-        }
-        ui.separator();
-        ui.heading("Data on this computer");
-        ui.label(self.state.root.display().to_string());
-        ui.weak("Audio, transcripts, Markdown notes, settings, and actions are stored here. Existing recordings from the earlier portable build are reused when found next to the executable.");
     }
+    fn save_speech_settings(&mut self, ctx: &egui::Context) {
+        self.dispatch(
+            Command::SpeechSettings {
+                language: self.speech_language.clone(),
+                model: self.speech_model.clone(),
+            },
+            ctx,
+        );
+    }
+
     fn dialogs(&mut self, ctx: &egui::Context) {
         if self.pending_navigation.is_some() {
             egui::Window::new("Unsaved notes")
@@ -1112,28 +1482,51 @@ impl Drop for Desktop {
         self.state.overlay.hide();
     }
 }
-fn copy_command(ui: &mut egui::Ui, ctx: &egui::Context, text: &str) {
-    ui.horizontal_wrapped(|ui| {
-        ui.code(text);
-        if ui.small_button("Copy").clicked() {
-            ctx.copy_text(text.into());
-        }
-    });
-}
-fn markdown(ui: &mut egui::Ui, text: &str) {
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            ui.add_space(6.0);
-        } else if let Some(heading) = line.strip_prefix("# ").or_else(|| line.strip_prefix("## ")) {
-            ui.heading(heading);
-        } else if let Some(heading) = line.strip_prefix("### ") {
-            ui.strong(heading);
-        } else if let Some(item) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
-            ui.label(format!("• {item}"));
+fn nav(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
+    let fill = if selected {
+        if ui.visuals().dark_mode {
+            egui::Color32::from_rgb(47, 39, 75)
         } else {
-            ui.label(line);
+            egui::Color32::from_rgb(230, 224, 251)
         }
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    ui.add(
+        egui::Button::new(
+            egui::RichText::new(text)
+                .color(if selected {
+                    if ui.visuals().dark_mode {
+                        egui::Color32::from_rgb(185, 168, 255)
+                    } else {
+                        ACCENT
+                    }
+                } else {
+                    ui.visuals().text_color()
+                })
+                .strong(),
+        )
+        .fill(fill)
+        .stroke(egui::Stroke::NONE)
+        .corner_radius(9),
+    )
+}
+fn short(text: &str, max: usize) -> String {
+    let s: String = text.chars().take(max).collect();
+    if text.chars().count() > max {
+        format!("{s}…")
+    } else {
+        s
     }
+}
+fn date(text: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(text)
+        .map(|d| {
+            d.with_timezone(&chrono::Local)
+                .format("%b %d, %Y")
+                .to_string()
+        })
+        .unwrap_or_else(|_| text.to_owned())
 }
 #[cfg(test)]
 mod tests {

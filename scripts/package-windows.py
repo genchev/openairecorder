@@ -6,8 +6,7 @@ import zipfile
 repo = Path(__file__).resolve().parent.parent
 tools = Path('/workspace/.tools')
 compiler = tools / 'llvm-mingw-20261006-ucrt-ubuntu-22.04-x86_64'
-whisper = tools / 'whisper-windows-v1.8.7.zip'
-assert hashlib.sha256(whisper.read_bytes()).hexdigest() == 'd9627486e1c34a03745880485593473e047294260ce9a3cb0aa8deaf15b99af6'
+whisper = tools / 'whisper-windows-portable/bin/whisper-cli.exe'
 assert hashlib.sha256((tools / 'llvm-mingw.tar.xz').read_bytes()).hexdigest() == '5f9c6ed95b2d4bdb2869a488c5fd5857fbdabcf288a0aa3eb1da43f6a08d8ab4'
 output = repo / 'dist' / 'OpenAIRecorder-Native-Windows-x64.zip'
 output.parent.mkdir(exist_ok=True)
@@ -18,11 +17,10 @@ with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED, strict_times
     archive.write(tools / 'llvm-LICENSE.txt', f'{prefix}/licenses/LLVM.txt')
     archive.write(compiler / 'x86_64-w64-mingw32/share/mingw32/COPYING', f'{prefix}/licenses/mingw-w64.txt')
     archive.write(tools / 'whisper.cpp/LICENSE', f'{prefix}/licenses/whisper.cpp.txt')
-    for name in ['README.md', 'VALIDATION.md', 'scripts/setup-windows.ps1', 'scripts/start-windows.ps1']:
+    for name in ['README.md', 'VALIDATION.md', 'docs/screenshots/conversation-dark.png', 'docs/screenshots/conversation-light.png']:
         archive.write(repo / name, f'{prefix}/{name}')
-    with zipfile.ZipFile(whisper) as binaries:
-        for name in ['whisper-cli.exe', 'whisper.dll', 'ggml.dll', 'ggml-base.dll', 'ggml-cpu.dll']:
-            archive.writestr(f'{prefix}/.local-tools/whisper/Release/{name}', binaries.read(f'Release/{name}'))
+    archive.write(whisper, f'{prefix}/.local-tools/whisper/Release/whisper-cli.exe')
+    archive.write(repo / 'assets/fonts/OFL.txt', f'{prefix}/licenses/Inter-OFL.txt')
     registry = tools / 'cargo/registry/src'
     import tomllib
     dependencies = {(entry['name'], entry['version']) for entry in tomllib.loads((repo / 'Cargo.lock').read_text())['package']}
@@ -37,35 +35,37 @@ with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED, strict_times
     if model.is_file():
         assert hashlib.sha256(model.read_bytes()).hexdigest() == 'be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21'
         archive.write(model, f'{prefix}/.local-tools/ggml-tiny.bin')
-    archive.writestr(f'{prefix}/START-HERE.txt', '''OpenAIRecorder 0.2 — Native Windows 10/11 x64 prototype
+    archive.writestr(f'{prefix}/START-HERE.txt', r'''OpenAIRecorder 0.3 — Native Windows 10/11 x64
 
-1. Extract this whole folder to a writable location on your computer.
-2. In PowerShell install dependencies:
-   winget install --id Gyan.FFmpeg --exact
-   winget install --id Microsoft.VCRedist.2015+.x64 --exact
-3. Open a NEW PowerShell in the extracted OpenAIRecorder folder:
-   .\\scripts\\setup-windows.ps1
-   (Downloads and verifies the local speech model if not bundled.)
-4. Install and sign in to Codex or Claude Code. The GUI also shows instructions:
-   npm install -g @openai/codex
-   codex login
-   OR: winget install --id Anthropic.ClaudeCode --exact
-       claude auth login
-5. Double-click openairecorder.exe (no Rust installation required).
-   This opens the native desktop GUI. No browser or localhost server is launched.
-   You can also use .\\scripts\\start-windows.ps1 from a fresh PowerShell.
-6. Start recording. Pause/Resume from the main window or floating widget keeps
-   the same recording open and excludes paused time from the audio/timer.
-   Stop saves it. The floating controls also work when the window is minimized.
+Extract the entire folder, then double-click openairecorder.exe.
+No setup scripts, PowerShell, Rust installation, or Visual C++ installer is
+required for recording, WAV playback, and local speech recognition.
+Keep libunwind.dll and the .local-tools folder beside the executable.
 
-Data is stored under %LOCALAPPDATA%\\OpenAIRecorder\\recordings.
-Existing recordings next to the executable from the older version are reused. The chosen CLI receives
-transcript text only when you confirm generating notes. Subscription limits apply.
+Whisper and its multilingual tiny model are included. Bulgarian is the default
+speech language. Change it in Settings for English or automatic detection.
+You can select a larger multilingual Whisper model in Settings for improved
+recognition; tiny is fast but can make mistakes, especially in Bulgarian.
 
-This executable was cross-built on Linux. Native widget behavior and Windows
-system-audio capture still need validation on a Windows computer.
-See README.md for capture instructions, settings, and current limitations.
+For AI notes, the app detects installed Codex or Claude Code agents. Install and
+sign in through the provider's official setup process if needed; Settings links
+to their guides. Existing subscription logins are reused. No API key is needed.
+This app does not override company restrictions on installing software.
+
+Record, Pause/Resume, then Stop & save. Open the conversation, create its
+transcript, then choose an agent under Audio & AI. Generated or imported
+Markdown is rendered in Overview. Check actions off or add open actions to the
+global list. Import Markdown with task checkboxes (- [ ] / - [x]) using the GUI.
+
+Native recordings need no ffmpeg. Other imported audio formats may need an
+existing ffmpeg installation for transcription. Mono 16 kHz PCM16 WAV works
+without it. The app does not ask you to run an installation script.
+
+Data: %LOCALAPPDATA%\OpenAIRecorder\recordings (legacy portable data is reused).
+The build was cross-compiled on Linux. Physical Windows audio and floating
+widget behavior still require Windows testing. See README.md / VALIDATION.md.
 ''')
+
 digest = hashlib.sha256(output.read_bytes()).hexdigest()
 output.with_suffix('.zip.sha256').write_text(f'{digest}  {output.name}\n')
 print(f'Packaged {output.name} ({output.stat().st_size:,} bytes), SHA-256 {digest}')

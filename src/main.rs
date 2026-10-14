@@ -5,7 +5,9 @@ mod app;
 mod audio;
 #[cfg(windows)]
 mod capture;
+mod design;
 mod desktop;
+mod document;
 mod overlay;
 #[cfg(windows)]
 mod playback;

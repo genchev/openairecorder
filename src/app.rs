@@ -35,6 +35,32 @@ pub struct Recording {
     #[serde(default)]
     pub actions: Vec<Action>,
 }
+fn apply_document(r: &mut Recording, document: String, preserve_completion: bool) {
+    let mut actions = Vec::new();
+    for task in crate::document::tasks(&document) {
+        if actions.iter().any(|a: &Action| a.title == task.title) {
+            continue;
+        }
+        let old = r.actions.iter().find(|a| a.title == task.title);
+        actions.push(Action {
+            id: old.map(|a| a.id).unwrap_or_else(Uuid::new_v4),
+            title: task.title,
+            owner: old.and_then(|a| a.owner.clone()),
+            due: old.and_then(|a| a.due.clone()),
+            done: task.done || preserve_completion && old.is_some_and(|a| a.done),
+        });
+    }
+    let transcript = crate::document::transcript(&document);
+    if !transcript.is_empty() {
+        r.transcript = transcript;
+    }
+    r.actions = actions;
+    r.notes = crate::document::sync_tasks(&document, |title| {
+        r.actions.iter().find(|a| a.title == title).map(|a| a.done)
+    });
+    r.status = "ready".into();
+    r.error = None;
+}
 type Error = (StatusCode, String);
 #[derive(Serialize, Deserialize)]
 struct Settings {
@@ -111,6 +137,11 @@ pub(crate) mod desktop_api {
             provider: String,
             consent: bool,
         },
+        ImportMarkdown {
+            id: Uuid,
+            path: PathBuf,
+        },
+        PrepareAudio(Uuid),
         Notes {
             id: Uuid,
             notes: String,
@@ -135,6 +166,10 @@ pub(crate) mod desktop_api {
         GlobalRemove(Uuid),
         Delete(Uuid),
         Theme(String),
+        SpeechSettings {
+            language: String,
+            model: String,
+        },
         Playback(Uuid),
     }
     pub struct Outcome {
@@ -178,6 +213,42 @@ pub(crate) mod desktop_api {
         Ok((recovered, retained))
     }
     pub async fn snapshot(s: &State) -> Result<Snapshot, String> {
+        {
+            use std::hash::{Hash, Hasher};
+            let _lock = s.jobs.lock().await;
+            for mut r in s.list().await.map_err(|e| e.to_string())? {
+                if r.status == "processing" {
+                    continue;
+                }
+                let dir = s.root.join(r.id.to_string());
+                let returned = dir.join("agent-output.md");
+                if !tokio::fs::metadata(&returned)
+                    .await
+                    .is_ok_and(|m| m.len() > 0 && m.len() <= 1_000_000)
+                {
+                    continue;
+                }
+                let Ok(document) = tokio::fs::read_to_string(returned).await else {
+                    continue;
+                };
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                document.hash(&mut hasher);
+                let hash = format!("{:016x}", hasher.finish());
+                if tokio::fs::read_to_string(dir.join(".markdown-import-hash"))
+                    .await
+                    .ok()
+                    .as_deref()
+                    == Some(&hash)
+                {
+                    continue;
+                }
+                apply_document(&mut r, document, true);
+                s.save(&r).await.map_err(|e| e.to_string())?;
+                tokio::fs::write(dir.join(".markdown-import-hash"), hash)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
         Ok(Snapshot {
             sessions: s.list().await.map_err(|e| e.to_string())?,
             actions: s.globals().await.map_err(|e| e.1)?,
@@ -302,6 +373,57 @@ pub(crate) mod desktop_api {
                     .map_err(|e| e.1)?;
                 outcome.message = "Agent is generating notes…".into();
             }
+            Command::ImportMarkdown { id, path } => {
+                let _lock = s.jobs.lock().await;
+                let mut r = s.load(id).await.map_err(|e| e.1)?;
+                if r.status == "processing" {
+                    return Err("Wait for processing to finish".into());
+                }
+                let size = tokio::fs::metadata(&path)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .len();
+                if size == 0 || size > 1_000_000 {
+                    return Err("Choose a nonempty UTF-8 Markdown file under 1 MB".into());
+                }
+                let document = tokio::fs::read_to_string(path)
+                    .await
+                    .map_err(|e| format!("Cannot read UTF-8 Markdown: {e}"))?;
+                apply_document(&mut r, document, true);
+                s.save(&r).await.map_err(|e| e.to_string())?;
+                outcome.session = Some(id);
+                outcome.message = format!("Notes imported · {} action items", r.actions.len());
+            }
+            Command::PrepareAudio(id) => {
+                let r = s.load(id).await.map_err(|e| e.1)?;
+                let dir = s.root.join(id.to_string());
+                let handoff = dir.join("audio-handoff");
+                tokio::fs::create_dir_all(&handoff)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let extension = match r.audio_type.as_str() {
+                    "audio/wav" => "wav",
+                    "audio/mpeg" => "mp3",
+                    "audio/mp4" => "m4a",
+                    "audio/ogg" => "ogg",
+                    "audio/flac" => "flac",
+                    "audio/webm" => "webm",
+                    _ => "bin",
+                };
+                tokio::fs::copy(
+                    dir.join("audio"),
+                    handoff.join(format!("recording.{extension}")),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                tokio::fs::write(
+                    handoff.join("INSTRUCTIONS.txt"),
+                    crate::document::audio_prompt(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                outcome.message = "Audio and instructions are ready. Upload them to a service that supports audio, then import its Markdown.".into();
+            }
             Command::Notes { id, notes } => {
                 save_notes(
                     state,
@@ -357,6 +479,29 @@ pub(crate) mod desktop_api {
                 delete(state, Path(id), headers).await.map_err(|e| e.1)?;
                 outcome.message = "Session deleted; copied global actions retained".into();
             }
+            Command::SpeechSettings { language, model } => {
+                if !["bg", "en", "auto"].contains(&language.as_str()) {
+                    return Err("Unsupported speech language".into());
+                }
+                if !model.is_empty() && !std::path::Path::new(&model).is_file() {
+                    return Err("Choose an existing Whisper model file".into());
+                }
+                let _lock = s.jobs.lock().await;
+                let settings = crate::transcription::SpeechSettings { language, model };
+                tokio::fs::write(
+                    s.root.join("speech-settings.json.tmp"),
+                    serde_json::to_vec(&settings).map_err(|e| e.to_string())?,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                tokio::fs::rename(
+                    s.root.join("speech-settings.json.tmp"),
+                    s.root.join("speech-settings.json"),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                outcome.message = "Speech preferences saved".into();
+            }
             Command::Theme(theme) => {
                 set_settings(state, Json(Settings { theme }))
                     .await
@@ -365,23 +510,14 @@ pub(crate) mod desktop_api {
             Command::Playback(id) => {
                 s.load(id).await.map_err(|e| e.1)?;
                 let dir = s.root.join(id.to_string());
-                let wav = dir.join("playback.wav");
-                if !wav.is_file() {
-                    let mut cmd = tokio::process::Command::new(&s.transcriber.ffmpeg);
-                    #[cfg(windows)]
-                    cmd.creation_flags(0x08000000);
-                    let result = cmd
-                        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
-                        .arg(dir.join("audio"))
-                        .args(["-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le"])
-                        .arg(&wav)
-                        .output()
-                        .await
-                        .map_err(|e| format!("Cannot start ffmpeg: {e}"))?;
-                    if !result.status.success() {
-                        let _ = tokio::fs::remove_file(wav).await;
-                        return Err("Cannot decode this audio file for playback".into());
-                    }
+                let wav = dir.join("audio");
+                let reader = hound::WavReader::open(&wav).map_err(|_| "In-app playback supports PCM WAV recordings. Export other formats to play in your media app.".to_string())?;
+                let spec = reader.spec();
+                if spec.channels != 1
+                    || spec.bits_per_sample != 16
+                    || spec.sample_format != hound::SampleFormat::Int
+                {
+                    return Err("In-app playback requires mono 16-bit PCM WAV. Native recordings use this format.".into());
                 }
                 outcome.session = Some(id);
                 outcome.file = Some(wav);
@@ -430,6 +566,80 @@ pub(crate) mod desktop_api {
             assert_eq!(data.theme, "dark");
             execute(&s, Command::Delete(r.id)).await.unwrap();
             assert_eq!(snapshot(&s).await.unwrap().actions.len(), 1);
+            tokio::fs::remove_dir_all(s.root).await.unwrap();
+        }
+        #[tokio::test]
+        async fn returned_markdown_import_watch_and_checklists_keep_bulgarian_and_identity() {
+            let (s, r) = super::super::tests::fixture().await;
+            let file = s.root.join("returned.md");
+            let markdown = "# Среща\n\n## Actions\n- [ ] Мария да изпрати офертата\n- [x] Готов преглед\n\n## Full transcript\n**Мария:** Ще изпратя офертата.\n";
+            tokio::fs::write(&file, markdown).await.unwrap();
+            execute(
+                &s,
+                Command::ImportMarkdown {
+                    id: r.id,
+                    path: file,
+                },
+            )
+            .await
+            .unwrap();
+            let imported = s.load(r.id).await.unwrap();
+            assert_eq!(imported.actions.len(), 2);
+            assert_eq!(imported.actions[0].title, "Мария да изпрати офертата");
+            assert!(imported.actions[0].owner.is_none());
+            assert!(imported.transcript.contains("Ще изпратя"));
+            let id = imported.actions[0].id;
+            execute(
+                &s,
+                Command::Copy {
+                    id: r.id,
+                    action: id,
+                },
+            )
+            .await
+            .unwrap();
+            execute(
+                &s,
+                Command::Complete {
+                    id: r.id,
+                    action: id,
+                    done: true,
+                },
+            )
+            .await
+            .unwrap();
+            let dir = s.root.join(r.id.to_string());
+            tokio::fs::write(dir.join("agent-output.md"), markdown)
+                .await
+                .unwrap();
+            let first = snapshot(&s).await.unwrap();
+            assert_eq!(first.sessions[0].actions[0].id, id);
+            assert!(first.sessions[0].actions[0].done);
+            assert!(!first.actions[0].action.done);
+            // An unchanged return file must not overwrite a local checkbox edit.
+            execute(
+                &s,
+                Command::Complete {
+                    id: r.id,
+                    action: id,
+                    done: false,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(!snapshot(&s).await.unwrap().sessions[0].actions[0].done);
+            let exported = tokio::fs::read_to_string(dir.join("notes.md"))
+                .await
+                .unwrap();
+            assert_eq!(exported.matches("Мария да изпрати офертата").count(), 1);
+            assert!(exported.contains("- [ ] Мария"));
+            tokio::fs::write(
+                dir.join("agent-output.md"),
+                format!("{markdown}\n## More actions\n- [ ] Проверка на дизайна\n"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(snapshot(&s).await.unwrap().sessions[0].actions.len(), 3);
             tokio::fs::remove_dir_all(s.root).await.unwrap();
         }
         #[tokio::test]
@@ -543,6 +753,9 @@ impl State {
             format!("# {}\n\n{}\n", r.title, r.transcript),
         )
         .await?;
+        let synced = crate::document::sync_tasks(&r.notes, |title| {
+            r.actions.iter().find(|a| a.title == title).map(|a| a.done)
+        });
         let actions = r
             .actions
             .iter()
@@ -557,14 +770,15 @@ impl State {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        tokio::fs::write(
-            dir.join("notes.md"),
+        let exported = if crate::document::tasks(&r.notes).is_empty() {
             format!(
                 "# {}\n\n{}\n\n## Action items\n{}\n",
-                r.title, r.notes, actions
-            ),
-        )
-        .await?;
+                r.title, synced, actions
+            )
+        } else {
+            synced
+        };
+        tokio::fs::write(dir.join("notes.md"), exported).await?;
         Ok(())
     }
     async fn load(&self, id: Uuid) -> Result<Recording, Error> {
@@ -708,7 +922,7 @@ fn local(headers: &HeaderMap) -> Result<(), Error> {
 }
 async fn config(Extract(s): Extract<State>) -> Json<serde_json::Value> {
     Json(
-        serde_json::json!({"local_transcription":s.transcriber.available().await,"codex":s.agents.detect("codex").await,"claude":s.agents.detect("claude").await}),
+        serde_json::json!({"local_transcription":s.transcriber.available(&s.root).await,"codex":s.agents.detect("codex").await,"claude":s.agents.detect("claude").await}),
     )
 }
 async fn list(Extract(s): Extract<State>) -> Result<Json<Vec<Recording>>, Error> {
@@ -777,7 +991,11 @@ async fn save_notes(
         ));
     }
     if let Some(notes) = input.notes {
-        r.notes = notes;
+        if crate::document::tasks(&notes).is_empty() {
+            r.notes = notes;
+        } else {
+            apply_document(&mut r, notes, false);
+        }
     }
     if let Some(pinned) = input.pinned {
         r.pinned = pinned;
@@ -944,7 +1162,7 @@ async fn generate_notes(
     if r.transcript.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            "Generate a local transcript first".into(),
+            "Generate a transcript or import a Full transcript section first".into(),
         ));
     }
     r.status = "processing".into();
@@ -1032,6 +1250,9 @@ async fn session_toggle(
         .find(|a| a.id == action)
         .ok_or((StatusCode::NOT_FOUND, "Action not found".into()))?
         .done = input.done;
+    r.notes = crate::document::sync_tasks(&r.notes, |title| {
+        r.actions.iter().find(|a| a.title == title).map(|a| a.done)
+    });
     s.save(&r).await.map_err(internal)?;
     Ok(StatusCode::NO_CONTENT)
 }
