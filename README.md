@@ -6,7 +6,7 @@ OpenAIRecorder 0.4 is a native Rust Windows app that sends recorded audio direct
 
 [Download the Gemini Windows x64 app](https://github.com/genchev/openairecorder/raw/refs/heads/main/downloads/OpenAIRecorder-Gemini-Windows-x64.zip)
 
-Extract the ZIP and double-click `openairecorder.exe`. Keep `libunwind.dll` beside it. No setup scripts, Rust, local speech models, ffmpeg, or Visual C++ installer are required.
+Extract the ZIP and double-click `openairecorder.exe`. Keep `libunwind.dll` beside it. No setup scripts, Rust, or local speech models are required.
 
 ## Gemini settings
 
