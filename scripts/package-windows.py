@@ -15,7 +15,7 @@ with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED, strict_times
     archive.write(compiler / 'x86_64-w64-mingw32/bin/libunwind.dll', f'{prefix}/libunwind.dll')
     archive.write(tools / 'llvm-LICENSE.txt', f'{prefix}/licenses/LLVM.txt')
     archive.write(compiler / 'x86_64-w64-mingw32/share/mingw32/COPYING', f'{prefix}/licenses/mingw-w64.txt')
-    for name in ['README.md', 'VALIDATION.md', 'docs/screenshots/conversation-dark.png', 'docs/screenshots/conversation-light.png', 'docs/screenshots/gemini-settings.png', 'docs/screenshots/recording-controls-preview.png']:
+    for name in ['README.md', 'VALIDATION.md', 'docs/screenshots/conversation-dark.png', 'docs/screenshots/conversation-light.png', 'docs/screenshots/gemini-settings.png', 'docs/screenshots/recording-controls-preview.png', 'docs/screenshots/library-archives.png']:
         archive.write(repo / name, f'{prefix}/{name}')
     archive.write(repo / 'assets/fonts/OFL.txt', f'{prefix}/licenses/Inter-OFL.txt')
     registry = tools / 'cargo/registry/src'
@@ -53,7 +53,8 @@ retry/recovery. Use Retry pending audio after key/model/quota/network errors.
 
 Your key is encrypted for your Windows account and stored separately from
 recordings and Markdown. Audio/notes themselves are not encrypted. Recordings
-normally live under %LOCALAPPDATA%\OpenAIRecorderecordings; older portable
+normally live under %LOCALAPPDATA%\OpenAIRecorder
+ecordings; older portable
 data is reused. The app never writes the API key into exports or provider URLs.
 
 Existing/imported mono 16 kHz PCM16 WAV can be processed in minute batches.

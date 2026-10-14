@@ -31,6 +31,8 @@ pub struct Recording {
     pub error: Option<String>,
     #[serde(default)]
     pub pinned: bool,
+    #[serde(default)]
+    pub archived_at: Option<String>,
     #[serde(default = "default_audio_type")]
     pub audio_type: String,
     #[serde(default)]
@@ -170,6 +172,10 @@ pub(crate) mod desktop_api {
             done: bool,
         },
         GlobalRemove(Uuid),
+        Archive {
+            id: Uuid,
+            archived: bool,
+        },
         Delete(Uuid),
         Theme(String),
         Playback(Uuid),
@@ -215,6 +221,9 @@ pub(crate) mod desktop_api {
         Ok((recovered, retained))
     }
     pub async fn snapshot(s: &State) -> Result<Snapshot, String> {
+        s.prune_archives(chrono::Utc::now())
+            .await
+            .map_err(|e| e.to_string())?;
         {
             use std::hash::{Hash, Hasher};
             let _lock = s.jobs.lock().await;
@@ -379,6 +388,7 @@ pub(crate) mod desktop_api {
                     notes: String::new(),
                     error: None,
                     pinned: false,
+                    archived_at: None,
                     audio_type: audio_type.into(),
                     actions: vec![],
                 };
@@ -462,6 +472,33 @@ pub(crate) mod desktop_api {
             }
             Command::GlobalRemove(id) => {
                 global_delete(state, Path(id)).await.map_err(|e| e.1)?;
+            }
+            Command::Archive { id, archived } => {
+                let _lock = s.jobs.lock().await;
+                let mut r = s.load(id).await.map_err(|e| e.1)?;
+                if r.status == "recording" || r.status == "processing" || s.gemini.running(id).await
+                {
+                    return Err(
+                        "Wait until recording and processing finish before changing the archive"
+                            .into(),
+                    );
+                }
+                if archived {
+                    // Repeated clicks must not extend the retention deadline.
+                    if r.archived_at.is_none() {
+                        r.archived_at = Some(chrono::Utc::now().to_rfc3339());
+                    }
+                    r.pinned = false;
+                } else {
+                    r.archived_at = None;
+                }
+                s.save(&r).await.map_err(|e| e.to_string())?;
+                outcome.message = if archived {
+                    "Archived; automatically deleted after 30 days"
+                } else {
+                    "Restored to library"
+                }
+                .into();
             }
             Command::Delete(id) => {
                 delete(state, Path(id), headers).await.map_err(|e| e.1)?;
@@ -725,8 +762,30 @@ impl State {
                 state.save(&record).await?;
             }
         }
+        state.prune_archives(chrono::Utc::now()).await?;
         crate::gemini::recover(&state).await?;
         Ok(state)
+    }
+    pub(crate) async fn prune_archives(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()> {
+        let _lock = self.jobs.lock().await;
+        for r in self.list().await? {
+            let expired = r
+                .archived_at
+                .as_deref()
+                .and_then(|date| chrono::DateTime::parse_from_rfc3339(date).ok())
+                .is_some_and(|date| now.signed_duration_since(date) >= chrono::Duration::days(30));
+            if expired
+                && r.status != "recording"
+                && r.status != "processing"
+                && !self.gemini.running(r.id).await
+            {
+                tokio::fs::remove_dir_all(self.root.join(r.id.to_string())).await?;
+            }
+        }
+        Ok(())
     }
     pub(crate) async fn save(&self, r: &Recording) -> anyhow::Result<()> {
         let dir = self.root.join(r.id.to_string());
@@ -967,6 +1026,12 @@ async fn save_notes(
         }
     }
     if let Some(pinned) = input.pinned {
+        if pinned && r.archived_at.is_some() {
+            return Err((
+                StatusCode::CONFLICT,
+                "Restore the session before pinning".into(),
+            ));
+        }
         r.pinned = pinned;
     }
     s.save(&r).await.map_err(internal)?;
@@ -1055,6 +1120,7 @@ async fn upload(
         notes: String::new(),
         error: None,
         pinned: false,
+        archived_at: None,
         audio_type,
         actions: vec![],
     };
@@ -1310,6 +1376,7 @@ mod tests {
             notes: "# Summary\nProposal agreed.".into(),
             error: None,
             pinned: false,
+            archived_at: None,
             audio_type: "audio/wav".into(),
             actions: vec![Action {
                 id: Uuid::new_v4(),
@@ -1321,6 +1388,136 @@ mod tests {
         };
         s.save(&r).await.unwrap();
         (s, r)
+    }
+    #[tokio::test]
+    async fn archive_retention_uses_archive_date_restores_and_preserves_global_actions() {
+        use desktop_api::{Command, execute};
+        let (s, mut r) = fixture().await;
+        r.created_at = "2000-01-01T00:00:00Z".into();
+        r.pinned = true;
+        s.save(&r).await.unwrap();
+        copy_action(
+            Extract(s.clone()),
+            Json(CopyAction {
+                session: r.id,
+                action: r.actions[0].id,
+            }),
+        )
+        .await
+        .unwrap();
+        execute(
+            &s,
+            Command::Archive {
+                id: r.id,
+                archived: true,
+            },
+        )
+        .await
+        .unwrap();
+        let archived = s.load(r.id).await.unwrap();
+        assert!(!archived.pinned);
+        let date = archived.archived_at.clone().unwrap();
+        execute(
+            &s,
+            Command::Archive {
+                id: r.id,
+                archived: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            s.load(r.id).await.unwrap().archived_at.as_deref(),
+            Some(date.as_str())
+        );
+        assert!(
+            execute(
+                &s,
+                Command::Pin {
+                    id: r.id,
+                    pinned: true
+                }
+            )
+            .await
+            .is_err()
+        );
+        let start = chrono::DateTime::parse_from_rfc3339(&date)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        s.prune_archives(start + chrono::Duration::days(30) - chrono::Duration::seconds(1))
+            .await
+            .unwrap();
+        assert!(s.root.join(r.id.to_string()).exists());
+        execute(
+            &s,
+            Command::Archive {
+                id: r.id,
+                archived: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(s.load(r.id).await.unwrap().archived_at.is_none());
+        s.prune_archives(start + chrono::Duration::days(31))
+            .await
+            .unwrap();
+        assert!(s.root.join(r.id.to_string()).exists());
+        // Expiration removes all audio/notes/segments, without touching global copies.
+        r.archived_at = Some(date);
+        r.pinned = false;
+        s.save(&r).await.unwrap();
+        tokio::fs::write(
+            s.root.join(r.id.to_string()).join("audio"),
+            b"fixture audio",
+        )
+        .await
+        .unwrap();
+        s.prune_archives(start + chrono::Duration::days(30))
+            .await
+            .unwrap();
+        assert!(!s.root.join(r.id.to_string()).exists());
+        assert_eq!(s.globals().await.unwrap().len(), 1);
+        tokio::fs::remove_dir_all(s.root).await.unwrap();
+    }
+    #[tokio::test]
+    async fn archives_protect_active_sessions_and_legacy_metadata() {
+        use desktop_api::{Command, execute};
+        let (s, mut r) = fixture().await;
+        let mut legacy = serde_json::to_value(&r).unwrap();
+        legacy.as_object_mut().unwrap().remove("archived_at");
+        assert!(
+            serde_json::from_value::<Recording>(legacy)
+                .unwrap()
+                .archived_at
+                .is_none()
+        );
+        r.status = "recording".into();
+        s.save(&r).await.unwrap();
+        assert!(
+            execute(
+                &s,
+                Command::Archive {
+                    id: r.id,
+                    archived: true
+                }
+            )
+            .await
+            .is_err()
+        );
+        r.archived_at = Some("2000-01-01T00:00:00Z".into());
+        s.save(&r).await.unwrap();
+        s.prune_archives(chrono::Utc::now()).await.unwrap();
+        assert!(s.root.join(r.id.to_string()).exists());
+        r.status = "ready".into();
+        r.archived_at = Some("bad timestamp".into());
+        s.save(&r).await.unwrap();
+        s.prune_archives(chrono::Utc::now()).await.unwrap();
+        assert!(s.root.join(r.id.to_string()).exists());
+        r.archived_at = Some((chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339());
+        s.save(&r).await.unwrap();
+        s.prune_archives(chrono::Utc::now()).await.unwrap();
+        assert!(s.root.join(r.id.to_string()).exists());
+        tokio::fs::remove_dir_all(s.root).await.unwrap();
     }
     #[tokio::test]
     async fn global_actions_survive_session_deletion_and_completion_is_independent() {

@@ -65,6 +65,7 @@ pub struct Desktop {
     last_refresh: Instant,
     pending_navigation: Option<View>,
     delete_confirm: Option<Uuid>,
+    archive_confirm: Option<Uuid>,
     close_confirm: bool,
     closing: bool,
     #[cfg(windows)]
@@ -141,6 +142,7 @@ impl Desktop {
             last_refresh: Instant::now() - Duration::from_secs(5),
             pending_navigation: None,
             delete_confirm: None,
+            archive_confirm: None,
             close_confirm: false,
             closing: false,
             #[cfg(windows)]
@@ -604,119 +606,97 @@ impl Desktop {
                 );
                 ui.add_space(10.0);
                 let query = self.search.to_lowercase();
-                let mut selected = None;
-                let mut delete_requested = None;
-                let mut matches = 0;
+                let mut action = None;
+                // A fixed rectangle per row prevents nested horizontal layouts from
+                // enlarging the scroll area and shifting subsequent rows to the right.
+                let rows: Vec<_> = self
+                    .data
+                    .sessions
+                    .iter()
+                    .filter(|r| {
+                        format!(
+                            "{} {} {} {}",
+                            r.title,
+                            r.transcript,
+                            r.notes,
+                            r.actions
+                                .iter()
+                                .map(|a| a.title.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        )
+                        .to_lowercase()
+                        .contains(&query)
+                    })
+                    .collect();
                 egui::ScrollArea::vertical()
                     .id_salt("library-scroll")
-                    .max_height(ui.available_height() - 78.0)
+                    .auto_shrink([false, false])
+                    .max_height((ui.available_height() - 78.0).max(0.0))
                     .show(ui, |ui| {
-                        for r in &self.data.sessions {
-                            if !format!(
-                                "{} {} {} {}",
-                                r.title,
-                                r.transcript,
-                                r.notes,
-                                r.actions
-                                    .iter()
-                                    .map(|a| a.title.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(" ")
-                            )
-                            .to_lowercase()
-                            .contains(&query)
-                            {
-                                continue;
-                            }
-                            matches += 1;
-                            let chosen = self.view == View::Session(r.id);
-                            let fill = if chosen {
-                                if ui.visuals().dark_mode {
-                                    egui::Color32::from_rgb(47, 39, 75)
-                                } else {
-                                    egui::Color32::from_rgb(230, 224, 251)
-                                }
-                            } else {
-                                egui::Color32::TRANSPARENT
-                            };
-                            let label = format!(
-                                "{}{}\n{}",
-                                if r.pinned { "•  " } else { "" },
-                                short(&r.title, 20),
-                                date(&r.created_at)
-                            );
-                            ui.horizontal(|ui| {
-                                let width = (ui.available_width() - 36.0).max(80.0);
-                                if ui
-                                    .add_sized(
-                                        [width, 58.0],
-                                        egui::Button::new(egui::RichText::new(label).size(13.0))
-                                            .fill(fill)
-                                            .stroke(egui::Stroke::NONE)
-                                            .corner_radius(9),
-                                    )
-                                    .on_hover_text(&r.title)
-                                    .clicked()
-                                {
-                                    selected = Some(r.id);
-                                }
-                                let enabled = !self.busy
-                                    && r.status != "recording"
-                                    && r.status != "processing"
-                                    && !self.state.gemini.is_running(r.id);
-                                let response = ui
-                                    .add_enabled_ui(enabled, |ui| {
-                                        ui.add_sized(
-                                            [28.0, 28.0],
-                                            egui::Button::new("").corner_radius(7),
-                                        )
-                                    })
-                                    .inner
-                                    .on_hover_text(if enabled {
-                                        "Delete session"
-                                    } else {
-                                        "Wait until recording and processing finish"
-                                    });
-                                response.widget_info(|| {
-                                    egui::WidgetInfo::labeled(
-                                        egui::WidgetType::Button,
+                        ui.spacing_mut().item_spacing.y = 3.0;
+                        let width = ui.available_width();
+                        let pinned: Vec<_> = rows
+                            .iter()
+                            .copied()
+                            .filter(|r| r.archived_at.is_none() && r.pinned)
+                            .collect();
+                        let recent: Vec<_> = rows
+                            .iter()
+                            .copied()
+                            .filter(|r| r.archived_at.is_none() && !r.pinned)
+                            .collect();
+                        let archived: Vec<_> = rows
+                            .iter()
+                            .copied()
+                            .filter(|r| r.archived_at.is_some())
+                            .collect();
+                        for (label, group) in [("PINNED", &pinned), ("CONVERSATIONS", &recent)] {
+                            if !group.is_empty() {
+                                ui.add_space(6.0);
+                                design::eyebrow(ui, label);
+                                for r in group {
+                                    let enabled = !self.busy
+                                        && r.status != "recording"
+                                        && r.status != "processing"
+                                        && !self.state.gemini.is_running(r.id);
+                                    if let Some(clicked) = library_row(
+                                        ui,
+                                        r,
+                                        self.view == View::Session(r.id),
                                         enabled,
-                                        "Delete session",
-                                    )
-                                });
-                                let c = response.rect.center();
-                                let stroke = egui::Stroke::new(
-                                    1.3_f32,
-                                    ui.visuals()
-                                        .widgets
-                                        .inactive
-                                        .fg_stroke
-                                        .color
-                                        .gamma_multiply(if enabled { 1.0 } else { 0.4 }),
-                                );
-                                ui.painter().line_segment(
-                                    [c + egui::vec2(-6.0, -4.0), c + egui::vec2(6.0, -4.0)],
-                                    stroke,
-                                );
-                                ui.painter().line_segment(
-                                    [c + egui::vec2(-2.0, -6.0), c + egui::vec2(2.0, -6.0)],
-                                    stroke,
-                                );
-                                ui.painter().add(egui::Shape::line(
-                                    vec![
-                                        c + egui::vec2(-4.0, -2.0),
-                                        c + egui::vec2(-3.0, 6.0),
-                                        c + egui::vec2(3.0, 6.0),
-                                        c + egui::vec2(4.0, -2.0),
-                                    ],
-                                    stroke,
-                                ));
-                                if response.clicked() {
-                                    delete_requested = Some(r.id);
+                                        width,
+                                    ) {
+                                        action = Some(clicked);
+                                    }
+                                }
+                            }
+                        }
+                        ui.add_space(8.0);
+                        egui::CollapsingHeader::new(format!("Archives  ({})", archived.len()))
+                            .id_salt("library-archives")
+                            .default_open(false)
+                            .open(if query.is_empty() { None } else { Some(true) })
+                            .show(ui, |ui| {
+                                design::subtitle(ui, "Deleted 30 days after archiving.");
+                                if archived.is_empty() {
+                                    design::subtitle(ui, "No archived conversations.");
+                                }
+                                let width = ui.available_width().min(width);
+                                for r in &archived {
+                                    let enabled = !self.busy && !self.state.gemini.is_running(r.id);
+                                    if let Some(clicked) = library_row(
+                                        ui,
+                                        r,
+                                        self.view == View::Session(r.id),
+                                        enabled,
+                                        width,
+                                    ) {
+                                        action = Some(clicked);
+                                    }
                                 }
                             });
-                        }
-                        if matches == 0 {
+                        if rows.is_empty() {
                             design::subtitle(
                                 ui,
                                 if query.is_empty() {
@@ -727,11 +707,22 @@ impl Desktop {
                             );
                         }
                     });
-                if let Some(id) = delete_requested {
-                    self.delete_confirm = Some(id);
-                }
-                if let Some(id) = selected {
-                    self.navigate(View::Session(id));
+                if let Some(action) = action {
+                    match action {
+                        LibraryAction::Select(id) => self.navigate(View::Session(id)),
+                        LibraryAction::Pin(id, pinned) => {
+                            self.dispatch(Command::Pin { id, pinned }, ctx)
+                        }
+                        LibraryAction::Archive(id) => self.archive_confirm = Some(id),
+                        LibraryAction::Restore(id) => self.dispatch(
+                            Command::Archive {
+                                id,
+                                archived: false,
+                            },
+                            ctx,
+                        ),
+                        LibraryAction::Delete(id) => self.delete_confirm = Some(id),
+                    }
                 }
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.add_space(8.0);
@@ -985,11 +976,27 @@ impl Desktop {
         ui.horizontal(|ui| {
             ui.heading("Recent conversations");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                design::subtitle(ui, &format!("{} sessions", self.data.sessions.len()))
+                design::subtitle(
+                    ui,
+                    &format!(
+                        "{} sessions",
+                        self.data
+                            .sessions
+                            .iter()
+                            .filter(|r| r.archived_at.is_none())
+                            .count()
+                    ),
+                )
             });
         });
         ui.add_space(8.0);
-        let sessions = self.data.sessions.clone();
+        let sessions: Vec<_> = self
+            .data
+            .sessions
+            .iter()
+            .filter(|r| r.archived_at.is_none())
+            .cloned()
+            .collect();
         if sessions.is_empty() {
             design::card(ui).show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -1073,12 +1080,38 @@ impl Desktop {
             return;
         };
         let busy = self.busy || r.status == "processing";
+        if let Some(archived) = &r.archived_at {
+            let expiry = chrono::DateTime::parse_from_rfc3339(archived)
+                .ok()
+                .and_then(|d| d.checked_add_signed(chrono::Duration::days(30)))
+                .map(|d| {
+                    d.with_timezone(&chrono::Local)
+                        .format("%b %d, %Y %H:%M")
+                        .to_string()
+                })
+                .unwrap_or_else(|| "unknown date".into());
+            ui.horizontal_wrapped(|ui| {
+                design::subtitle(ui, &format!("Archived · scheduled deletion: {expiry}"));
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Restore to library"))
+                    .clicked()
+                {
+                    self.dispatch(
+                        Command::Archive {
+                            id,
+                            archived: false,
+                        },
+                        ctx,
+                    );
+                }
+            });
+        }
         design::eyebrow(ui, &date(&r.created_at));
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new(&r.title).size(32.0).strong());
             if ui
                 .add_enabled(
-                    !busy,
+                    !busy && r.archived_at.is_none(),
                     egui::Button::new(if r.pinned { "Unpin" } else { "Pin" }),
                 )
                 .clicked()
@@ -1602,6 +1635,17 @@ if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
                     }
                 });
         }
+        if let Some(id) = self.archive_confirm {
+            egui::Window::new("Move to Archives?").collapsible(false).resizable(false).show(ctx, |ui| {
+                ui.label("This recording, transcript and notes will be automatically deleted 30 days after archiving.");
+                ui.label("You can restore it before then. Copied global actions remain.");
+                if ui.add_enabled(!self.busy, egui::Button::new("Archive session")).clicked() {
+                    self.archive_confirm = None;
+                    self.dispatch(Command::Archive { id, archived: true }, ctx);
+                }
+                if ui.button("Cancel").clicked() { self.archive_confirm = None; }
+            });
+        }
         if let Some(id) = self.delete_confirm {
             egui::Window::new("Delete this session?").collapsible(false).resizable(false).show(ctx,|ui|{
             ui.label("Its audio, transcript and notes will be deleted. Copied global actions remain.");
@@ -1641,6 +1685,176 @@ impl Drop for Desktop {
         self.state.overlay.hide();
     }
 }
+#[derive(Clone, Copy)]
+enum LibraryAction {
+    Select(Uuid),
+    Pin(Uuid, bool),
+    Archive(Uuid),
+    Restore(Uuid),
+    Delete(Uuid),
+}
+fn library_row(
+    ui: &mut egui::Ui,
+    r: &app::Recording,
+    selected: bool,
+    enabled: bool,
+    width: f32,
+) -> Option<LibraryAction> {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 32.0), egui::Sense::hover());
+    let archived = r.archived_at.is_some();
+    let title_rect = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2((rect.right() - 52.0).max(rect.left() + 1.0), rect.bottom()),
+    );
+    let fill = if selected {
+        if ui.visuals().dark_mode {
+            egui::Color32::from_rgb(47, 39, 75)
+        } else {
+            egui::Color32::from_rgb(230, 224, 251)
+        }
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    let response = ui
+        .place(
+            title_rect,
+            egui::Button::new("")
+                .fill(fill)
+                .stroke(egui::Stroke::NONE)
+                .corner_radius(7),
+        )
+        .on_hover_text(format!("{}\n{}", r.title, date(&r.created_at)));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &r.title));
+    let color = ui.visuals().text_color();
+    let mut text = egui::text::LayoutJob::simple_singleline(
+        r.title.clone(),
+        egui::FontId::proportional(13.0),
+        color,
+    );
+    text.wrap.max_width = (title_rect.width() - 16.0).max(1.0);
+    text.wrap.max_rows = 1;
+    text.wrap.break_anywhere = true;
+    let galley = ui.fonts_mut(|fonts| fonts.layout_job(text));
+    ui.painter()
+        .with_clip_rect(title_rect.intersect(ui.clip_rect()))
+        .galley(
+            egui::pos2(
+                title_rect.left() + 8.0,
+                title_rect.center().y - galley.size().y / 2.0,
+            ),
+            galley,
+            color,
+        );
+    let mut action = response.clicked().then_some(LibraryAction::Select(r.id));
+    response.context_menu(|ui| {
+        if ui
+            .add_enabled(enabled, egui::Button::new("Delete permanently…"))
+            .clicked()
+        {
+            action = Some(LibraryAction::Delete(r.id));
+            ui.close();
+        }
+    });
+    for index in 0..2 {
+        let bounds = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - 50.0 + index as f32 * 26.0, rect.top() + 4.0),
+            egui::vec2(24.0, 24.0),
+        );
+        let allowed = enabled && (index == 1 || !archived);
+        let label = if index == 0 {
+            if r.pinned {
+                "Unpin session"
+            } else {
+                "Pin session"
+            }
+        } else if archived {
+            "Restore to library"
+        } else {
+            "Archive · automatically delete after 30 days"
+        };
+        let mut icon_ui = ui.new_child(egui::UiBuilder::new().max_rect(bounds).id_salt((
+            "library-icon",
+            r.id,
+            index,
+        )));
+        if !allowed {
+            icon_ui.disable();
+        }
+        let response = icon_ui
+            .place(
+                bounds,
+                egui::Button::new("")
+                    .fill(egui::Color32::TRANSPARENT)
+                    .stroke(egui::Stroke::NONE)
+                    .corner_radius(5),
+            )
+            .on_hover_text(label);
+        response
+            .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, allowed, label));
+        let color = if !allowed {
+            design::muted(ui).gamma_multiply(0.4)
+        } else if index == 0 && r.pinned {
+            ACCENT
+        } else {
+            design::muted(ui)
+        };
+        let stroke = egui::Stroke::new(1.3_f32, color);
+        let c = bounds.center();
+        let painter = ui.painter();
+        if index == 0 {
+            painter.add(egui::Shape::line(
+                vec![
+                    c + egui::vec2(-3.0, -5.0),
+                    c + egui::vec2(3.0, -5.0),
+                    c + egui::vec2(3.0, -1.0),
+                    c + egui::vec2(5.0, 2.0),
+                    c + egui::vec2(-5.0, 2.0),
+                    c + egui::vec2(-3.0, -1.0),
+                    c + egui::vec2(-3.0, -5.0),
+                ],
+                stroke,
+            ));
+            painter.line_segment([c + egui::vec2(0.0, 2.0), c + egui::vec2(0.0, 7.0)], stroke);
+        } else {
+            painter.rect_stroke(
+                egui::Rect::from_center_size(c + egui::vec2(0.0, 2.0), egui::vec2(12.0, 8.0)),
+                1,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.line_segment(
+                [c + egui::vec2(-7.0, -3.0), c + egui::vec2(7.0, -3.0)],
+                stroke,
+            );
+            if archived {
+                painter.add(egui::Shape::line(
+                    vec![
+                        c + egui::vec2(-3.0, 0.0),
+                        c + egui::vec2(0.0, -3.0),
+                        c + egui::vec2(3.0, 0.0),
+                    ],
+                    stroke,
+                ));
+            } else {
+                painter.line_segment(
+                    [c + egui::vec2(-2.0, 1.0), c + egui::vec2(2.0, 1.0)],
+                    stroke,
+                );
+            }
+        }
+        if response.clicked() {
+            action = Some(if index == 0 {
+                LibraryAction::Pin(r.id, !r.pinned)
+            } else if archived {
+                LibraryAction::Restore(r.id)
+            } else {
+                LibraryAction::Archive(r.id)
+            });
+        }
+    }
+    action
+}
+
 fn recorder_preview(ui: &mut egui::Ui, paused: &mut bool) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(234.0, 52.0), egui::Sense::hover());
     ui.painter()
@@ -1793,14 +2007,6 @@ fn nav(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
         .corner_radius(9),
     )
 }
-fn short(text: &str, max: usize) -> String {
-    let s: String = text.chars().take(max).collect();
-    if text.chars().count() > max {
-        format!("{s}…")
-    } else {
-        s
-    }
-}
 fn date(text: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(text)
         .map(|d| {
@@ -1859,9 +2065,39 @@ mod tests {
             notes: "saved version".into(),
             error: None,
             pinned: false,
+            archived_at: None,
             audio_type: "audio/wav".into(),
             actions: vec![],
         };
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(244.0, 1200.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let x = ui.next_widget_position().x;
+                    let width = ui.available_width();
+                    for _ in 0..25 {
+                        let before = ui.next_widget_position();
+                        library_row(ui, &recording, false, true, width);
+                        let after = ui.next_widget_position();
+                        assert_eq!(after.x, x, "library rows must not drift horizontally");
+                        assert!(
+                            (after.y - before.y - 32.0 - ui.spacing().item_spacing.y).abs() < 0.1,
+                            "icons must not add vertical space"
+                        );
+                        assert!(
+                            ui.min_rect().right() <= x + width + 0.1,
+                            "rows must not widen the sidebar"
+                        );
+                    }
+                });
+            },
+        );
         app.sender
             .send(Message::Snapshot(
                 app.epoch,
