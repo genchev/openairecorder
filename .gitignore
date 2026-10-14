@@ -4,3 +4,5 @@
 *.log
 /.local-tools/
 /dist/
+gemini-key.bin
+gemini-key.bin.tmp

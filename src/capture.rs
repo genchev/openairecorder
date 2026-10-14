@@ -21,8 +21,8 @@ use std::{
 
 pub const RATE: u32 = 16000;
 pub struct CaptureResult {
-    pub path: PathBuf,
     pub warning: Option<String>,
+    pub chunks: u64,
 }
 pub struct Capture {
     pub stop: Arc<AtomicBool>,
@@ -261,6 +261,11 @@ fn record(
     anyhow::ensure!(overlay.start(), "Another recording is already active");
     active.store(true, Ordering::SeqCst);
     let mut mixer = Mixer::new(devices.len());
+    let mut voice = crate::audio::VoiceDetector::new();
+    let mut segmenter = crate::segments::Segmenter::new(
+        path.parent().context("No session folder")?.join("chunks"),
+        0,
+    )?;
     let mut last_flush = Instant::now();
     let mut limit = false;
     let mut is_paused = false;
@@ -305,12 +310,16 @@ fn record(
                 .map(|s| (*s as f32 / i16::MAX as f32).abs())
                 .fold(0.0, f32::max);
             level.store(peak.to_bits(), Ordering::Relaxed);
-            for sample in samples {
-                writer.write_sample(sample)?;
+            overlay.voice.store(voice.push(&samples), Ordering::Relaxed);
+            for sample in &samples {
+                writer.write_sample(*sample)?;
             }
+            segmenter.push(&samples)?;
         }
         if is_paused {
             level.store(0, Ordering::Relaxed);
+            voice.pause();
+            overlay.voice.store(false, Ordering::Relaxed);
         }
         if last_flush.elapsed() > Duration::from_secs(1) {
             writer.flush()?;
@@ -328,6 +337,7 @@ fn record(
     }
     drop(streams);
     writer.finalize()?;
+    let chunks = segmenter.finish()?;
     let mut warnings = vec![];
     if let Some(error) = errors.lock().ok().and_then(|e| e.clone()) {
         warnings.push(error);
@@ -340,7 +350,7 @@ fn record(
         warnings.push("Recording stopped at the WAV file-size limit.".into());
     }
     Ok(CaptureResult {
-        path,
+        chunks,
         warning: (!warnings.is_empty()).then(|| warnings.join(" ")),
     })
 }

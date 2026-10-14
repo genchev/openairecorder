@@ -1,4 +1,4 @@
-use crate::{agent::Agents, overlay::Overlay, transcription::Transcriber};
+use crate::overlay::Overlay;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Multipart, Path, State as Extract},
@@ -14,10 +14,9 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct State {
     pub root: PathBuf,
-    pub transcriber: Transcriber,
-    pub agents: Agents,
     pub overlay: Overlay,
     pub jobs: Arc<Mutex<()>>,
+    pub gemini: Arc<crate::gemini::Service>,
 }
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Recording {
@@ -26,6 +25,8 @@ pub struct Recording {
     pub created_at: String,
     pub status: String,
     pub transcript: String,
+    #[serde(default)]
+    pub gemini_processed: u64,
     pub notes: String,
     pub error: Option<String>,
     #[serde(default)]
@@ -126,22 +127,27 @@ pub(crate) mod desktop_api {
         pub theme: String,
     }
     pub enum Command {
+        GeminiSettings {
+            settings: crate::gemini::Settings,
+            key: String,
+        },
+        #[cfg_attr(not(windows), allow(dead_code))]
+        FinishLive {
+            id: Uuid,
+            total: u64,
+            warning: Option<String>,
+        },
+        ProcessGemini(Uuid),
+        RetryGemini(Uuid),
         Import {
             path: PathBuf,
             title: String,
             owned_capture: bool,
         },
-        Transcribe(Uuid),
-        Generate {
-            id: Uuid,
-            provider: String,
-            consent: bool,
-        },
         ImportMarkdown {
             id: Uuid,
             path: PathBuf,
         },
-        PrepareAudio(Uuid),
         Notes {
             id: Uuid,
             notes: String,
@@ -166,10 +172,6 @@ pub(crate) mod desktop_api {
         GlobalRemove(Uuid),
         Delete(Uuid),
         Theme(String),
-        SpeechSettings {
-            language: String,
-            model: String,
-        },
         Playback(Uuid),
     }
     pub struct Outcome {
@@ -217,7 +219,7 @@ pub(crate) mod desktop_api {
             use std::hash::{Hash, Hasher};
             let _lock = s.jobs.lock().await;
             for mut r in s.list().await.map_err(|e| e.to_string())? {
-                if r.status == "processing" {
+                if r.status == "processing" || r.status == "recording" {
                     continue;
                 }
                 let dir = s.root.join(r.id.to_string());
@@ -279,6 +281,35 @@ pub(crate) mod desktop_api {
             message: "Saved".into(),
         };
         match command {
+            Command::GeminiSettings { settings, key } => {
+                let _lock = s.jobs.lock().await;
+                settings.validate().map_err(|e| e.to_string())?;
+                crate::secrets::save(&s.root, &key).map_err(|e| e.to_string())?;
+                settings.save(&s.root).map_err(|e| e.to_string())?;
+                outcome.message = "Gemini settings saved".into();
+            }
+            Command::FinishLive { id, total, warning } => {
+                crate::gemini::finish_live(s, id, total, warning)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                s.gemini.start(s.clone(), id).await;
+                outcome.message =
+                    "Recording saved. Gemini is finishing the remaining audio.".into();
+            }
+            Command::ProcessGemini(id) => {
+                crate::gemini::prepare_import(s, id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                s.gemini.start(s.clone(), id).await;
+                outcome.message =
+                    "Gemini is processing this recording in one-minute segments.".into();
+            }
+            Command::RetryGemini(id) => {
+                crate::gemini::retry(s, id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                outcome.message = "Retrying pending Gemini audio".into();
+            }
             Command::Import {
                 path,
                 title,
@@ -344,6 +375,7 @@ pub(crate) mod desktop_api {
                     created_at: chrono::Utc::now().to_rfc3339(),
                     status: "recorded".into(),
                     transcript: String::new(),
+                    gemini_processed: 0,
                     notes: String::new(),
                     error: None,
                     pinned: false,
@@ -359,25 +391,11 @@ pub(crate) mod desktop_api {
                 outcome.session = Some(id);
                 outcome.message = "Recording saved on this computer".into();
             }
-            Command::Transcribe(id) => {
-                process(state, Path(id), headers).await.map_err(|e| e.1)?;
-                outcome.message = "Transcribing locally…".into();
-            }
-            Command::Generate {
-                id,
-                provider,
-                consent,
-            } => {
-                generate_notes(state, Path(id), Json(AgentRequest { provider, consent }))
-                    .await
-                    .map_err(|e| e.1)?;
-                outcome.message = "Agent is generating notes…".into();
-            }
             Command::ImportMarkdown { id, path } => {
                 let _lock = s.jobs.lock().await;
                 let mut r = s.load(id).await.map_err(|e| e.1)?;
-                if r.status == "processing" {
-                    return Err("Wait for processing to finish".into());
+                if r.status == "processing" || r.status == "recording" {
+                    return Err("Stop recording before importing notes".into());
                 }
                 let size = tokio::fs::metadata(&path)
                     .await
@@ -393,36 +411,6 @@ pub(crate) mod desktop_api {
                 s.save(&r).await.map_err(|e| e.to_string())?;
                 outcome.session = Some(id);
                 outcome.message = format!("Notes imported · {} action items", r.actions.len());
-            }
-            Command::PrepareAudio(id) => {
-                let r = s.load(id).await.map_err(|e| e.1)?;
-                let dir = s.root.join(id.to_string());
-                let handoff = dir.join("audio-handoff");
-                tokio::fs::create_dir_all(&handoff)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let extension = match r.audio_type.as_str() {
-                    "audio/wav" => "wav",
-                    "audio/mpeg" => "mp3",
-                    "audio/mp4" => "m4a",
-                    "audio/ogg" => "ogg",
-                    "audio/flac" => "flac",
-                    "audio/webm" => "webm",
-                    _ => "bin",
-                };
-                tokio::fs::copy(
-                    dir.join("audio"),
-                    handoff.join(format!("recording.{extension}")),
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-                tokio::fs::write(
-                    handoff.join("INSTRUCTIONS.txt"),
-                    crate::document::audio_prompt(),
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-                outcome.message = "Audio and instructions are ready. Upload them to a service that supports audio, then import its Markdown.".into();
             }
             Command::Notes { id, notes } => {
                 save_notes(
@@ -478,29 +466,6 @@ pub(crate) mod desktop_api {
             Command::Delete(id) => {
                 delete(state, Path(id), headers).await.map_err(|e| e.1)?;
                 outcome.message = "Session deleted; copied global actions retained".into();
-            }
-            Command::SpeechSettings { language, model } => {
-                if !["bg", "en", "auto"].contains(&language.as_str()) {
-                    return Err("Unsupported speech language".into());
-                }
-                if !model.is_empty() && !std::path::Path::new(&model).is_file() {
-                    return Err("Choose an existing Whisper model file".into());
-                }
-                let _lock = s.jobs.lock().await;
-                let settings = crate::transcription::SpeechSettings { language, model };
-                tokio::fs::write(
-                    s.root.join("speech-settings.json.tmp"),
-                    serde_json::to_vec(&settings).map_err(|e| e.to_string())?,
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-                tokio::fs::rename(
-                    s.root.join("speech-settings.json.tmp"),
-                    s.root.join("speech-settings.json"),
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-                outcome.message = "Speech preferences saved".into();
             }
             Command::Theme(theme) => {
                 set_settings(state, Json(Settings { theme }))
@@ -643,6 +608,25 @@ pub(crate) mod desktop_api {
             tokio::fs::remove_dir_all(s.root).await.unwrap();
         }
         #[tokio::test]
+        async fn editing_markdown_preserves_existing_structured_actions() {
+            let (s, r) = super::super::tests::fixture().await;
+            let original = r.actions[0].id;
+            execute(
+                &s,
+                Command::Notes {
+                    id: r.id,
+                    notes: "## Notes\n- [ ] New explicit task".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let saved = s.load(r.id).await.unwrap();
+            assert_eq!(saved.actions.len(), 2);
+            assert_eq!(saved.actions[0].id, original);
+            assert_eq!(saved.actions[1].title, "New explicit task");
+            tokio::fs::remove_dir_all(s.root).await.unwrap();
+        }
+        #[tokio::test]
         async fn owned_capture_is_moved_and_external_import_is_preserved() {
             let (s, _) = super::super::tests::fixture().await;
             let capture = s.root.join(".capture-test.wav");
@@ -728,10 +712,9 @@ impl State {
         tokio::fs::create_dir_all(&root).await?;
         let state = Self {
             root,
-            transcriber: Transcriber::from_env(),
-            agents: Agents::from_env(),
             overlay: Overlay::new(),
             jobs: Arc::new(Mutex::new(())),
+            gemini: Arc::new(crate::gemini::Service::new().unwrap()),
         };
         // A process cannot survive an application restart. Make interrupted jobs retryable.
         for mut record in state.list().await? {
@@ -742,9 +725,10 @@ impl State {
                 state.save(&record).await?;
             }
         }
+        crate::gemini::recover(&state).await?;
         Ok(state)
     }
-    async fn save(&self, r: &Recording) -> anyhow::Result<()> {
+    pub(crate) async fn save(&self, r: &Recording) -> anyhow::Result<()> {
         let dir = self.root.join(r.id.to_string());
         tokio::fs::write(dir.join("record.json.tmp"), serde_json::to_vec_pretty(r)?).await?;
         tokio::fs::rename(dir.join("record.json.tmp"), dir.join("record.json")).await?;
@@ -781,13 +765,13 @@ impl State {
         tokio::fs::write(dir.join("notes.md"), exported).await?;
         Ok(())
     }
-    async fn load(&self, id: Uuid) -> Result<Recording, Error> {
+    pub(crate) async fn load(&self, id: Uuid) -> Result<Recording, Error> {
         let bytes = tokio::fs::read(self.root.join(id.to_string()).join("record.json"))
             .await
             .map_err(|_| (StatusCode::NOT_FOUND, "Recording not found".into()))?;
         serde_json::from_slice(&bytes).map_err(internal)
     }
-    async fn list(&self) -> anyhow::Result<Vec<Recording>> {
+    pub(crate) async fn list(&self) -> anyhow::Result<Vec<Recording>> {
         let mut entries = tokio::fs::read_dir(&self.root).await?;
         let mut results = vec![];
         while let Some(entry) = entries.next_entry().await? {
@@ -809,33 +793,6 @@ pub fn router(state: State) -> Router {
             "/",
             get(|| async { Html(include_str!("../web/index.html")) }),
         )
-        .route(
-            "/app.js",
-            get(|| async {
-                (
-                    [("content-type", "application/javascript")],
-                    include_str!("../web/app.js"),
-                )
-            }),
-        )
-        .route(
-            "/style.css",
-            get(|| async {
-                (
-                    [("content-type", "text/css")],
-                    include_str!("../web/style.css"),
-                )
-            }),
-        )
-        .route(
-            "/theme.js",
-            get(|| async {
-                (
-                    [("content-type", "application/javascript")],
-                    include_str!("../web/theme.js"),
-                )
-            }),
-        )
         .route("/api/settings", get(get_settings).put(set_settings))
         .route(
             "/api/capture",
@@ -850,7 +807,6 @@ pub fn router(state: State) -> Router {
             "/api/recordings/{id}/actions/{action}",
             axum::routing::patch(session_toggle),
         )
-        .route("/api/recordings/{id}/agent", post(generate_notes))
         .route("/api/recordings/{id}/events", get(events))
         .route("/api/config", get(config))
         .route("/api/recordings", get(list).post(upload))
@@ -922,7 +878,7 @@ fn local(headers: &HeaderMap) -> Result<(), Error> {
 }
 async fn config(Extract(s): Extract<State>) -> Json<serde_json::Value> {
     Json(
-        serde_json::json!({"local_transcription":s.transcriber.available(&s.root).await,"codex":s.agents.detect("codex").await,"claude":s.agents.detect("claude").await}),
+        serde_json::json!({"gemini_configured":crate::secrets::load(&s.root).is_ok_and(|key|!key.is_empty()),"gemini_models":crate::gemini::Settings::load(&s.root),"local_transcription":false}),
     )
 }
 async fn list(Extract(s): Extract<State>) -> Result<Json<Vec<Recording>>, Error> {
@@ -984,17 +940,30 @@ async fn save_notes(
     }
     let _lock = s.jobs.lock().await;
     let mut r = s.load(id).await?;
-    if r.status == "processing" {
+    if r.status == "processing" || r.status == "recording" && input.notes.is_some() {
         return Err((
             StatusCode::CONFLICT,
-            "Wait for transcription to finish".into(),
+            "Stop live recording before editing its notes".into(),
         ));
     }
     if let Some(notes) = input.notes {
         if crate::document::tasks(&notes).is_empty() {
             r.notes = notes;
         } else {
-            apply_document(&mut r, notes, false);
+            for task in crate::document::tasks(&notes) {
+                if let Some(a) = r.actions.iter_mut().find(|a| a.title == task.title) {
+                    a.done = task.done;
+                } else {
+                    r.actions.push(Action {
+                        id: Uuid::new_v4(),
+                        title: task.title,
+                        owner: None,
+                        due: None,
+                        done: task.done,
+                    });
+                }
+            }
+            r.notes = notes;
         }
     }
     if let Some(pinned) = input.pinned {
@@ -1082,6 +1051,7 @@ async fn upload(
         created_at: chrono::Utc::now().to_rfc3339(),
         status: "recorded".into(),
         transcript: String::new(),
+        gemini_processed: 0,
         notes: String::new(),
         error: None,
         pinned: false,
@@ -1097,122 +1067,10 @@ async fn process(
     headers: HeaderMap,
 ) -> Result<StatusCode, Error> {
     local(&headers)?;
-    let _lock = s.jobs.lock().await;
-    let mut r = s.load(id).await?;
-    if r.status == "processing" {
-        return Err((StatusCode::CONFLICT, "Already processing".into()));
-    }
-    r.status = "processing".into();
-    r.error = None;
-    s.save(&r).await.map_err(internal)?;
-    drop(_lock);
-    tokio::spawn(async move {
-        let result = run_job(&s, &mut r).await;
-        match result {
-            Ok(()) => r.status = "ready".into(),
-            Err(e) => {
-                r.status = "failed".into();
-                r.error = Some(e.to_string());
-            }
-        }
-        if let Err(e) = s.save(&r).await {
-            eprintln!("Unable to save job result: {e}");
-        }
-    });
-    Ok(StatusCode::ACCEPTED)
-}
-async fn run_job(s: &State, r: &mut Recording) -> anyhow::Result<()> {
-    let dir = s.root.join(r.id.to_string());
-    r.transcript = s.transcriber.transcribe(&dir.join("audio"), &dir).await?;
-    Ok(())
-}
-#[derive(Deserialize)]
-struct AgentRequest {
-    provider: String,
-    consent: bool,
-}
-async fn generate_notes(
-    Extract(s): Extract<State>,
-    Path(id): Path<Uuid>,
-    Json(input): Json<AgentRequest>,
-) -> Result<StatusCode, Error> {
-    if !input.consent {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Confirm sharing the transcript with your selected agent".into(),
-        ));
-    }
-    if !["codex", "claude"].contains(&input.provider.as_str()) {
-        return Err((StatusCode::BAD_REQUEST, "Unknown agent".into()));
-    }
-    if !s.agents.detect(&input.provider).await.installed {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Agent not installed. Follow the installation instructions in the app.".into(),
-        ));
-    }
-    let _lock = s.jobs.lock().await;
-    let mut r = s.load(id).await?;
-    if r.status == "processing" {
-        return Err((
-            StatusCode::CONFLICT,
-            "A job is already running for this session".into(),
-        ));
-    }
-    if r.transcript.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Generate a transcript or import a Full transcript section first".into(),
-        ));
-    }
-    r.status = "processing".into();
-    r.error = None;
-    let dir = s
-        .root
-        .join(id.to_string())
-        .canonicalize()
-        .map_err(internal)?;
-    tokio::fs::write(dir.join("agent-events.jsonl"), b"")
+    crate::gemini::prepare_import(&s, id)
         .await
-        .map_err(internal)?;
-    tokio::fs::write(dir.join("agent-errors.log"), b"")
-        .await
-        .map_err(internal)?;
-    s.save(&r).await.map_err(internal)?;
-    drop(_lock);
-    tokio::spawn(async move {
-        match s
-            .agents
-            .generate(&input.provider, &r.transcript, &dir)
-            .await
-        {
-            Ok(output) => {
-                r.notes = output.notes_markdown;
-                r.actions = output
-                    .actions
-                    .into_iter()
-                    .map(|a| {
-                        let old = r.actions.iter().find(|old| old.title == a.title);
-                        Action {
-                            id: old.map(|o| o.id).unwrap_or_else(Uuid::new_v4),
-                            title: a.title,
-                            owner: a.owner,
-                            due: a.due,
-                            done: old.is_some_and(|o| o.done),
-                        }
-                    })
-                    .collect();
-                r.status = "ready".into();
-            }
-            Err(e) => {
-                r.status = "failed".into();
-                r.error = Some(e.to_string());
-            }
-        }
-        if let Err(e) = s.save(&r).await {
-            eprintln!("Cannot save notes: {e}");
-        }
-    });
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    s.gemini.start(s.clone(), id).await;
     Ok(StatusCode::ACCEPTED)
 }
 async fn events(
@@ -1348,9 +1206,15 @@ async fn delete(
     headers: HeaderMap,
 ) -> Result<StatusCode, Error> {
     local(&headers)?;
+    if s.gemini.running(id).await {
+        return Err((
+            StatusCode::CONFLICT,
+            "Wait for Gemini processing to finish before deleting".into(),
+        ));
+    }
     let _lock = s.jobs.lock().await;
     let r = s.load(id).await?;
-    if r.status == "processing" {
+    if r.status == "processing" || r.status == "recording" {
         return Err((
             StatusCode::CONFLICT,
             "Wait for processing to finish before deleting".into(),
@@ -1373,10 +1237,9 @@ mod tests {
         tokio::fs::create_dir(&root).await.unwrap();
         let state = State {
             root: root.clone(),
-            transcriber: Transcriber::from_env(),
-            agents: Agents::from_env(),
             overlay: Overlay::new(),
             jobs: Arc::new(Mutex::new(())),
+            gemini: Arc::new(crate::gemini::Service::new().unwrap()),
         };
         let app = router(state.clone());
         let payload = "--test\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nMeeting\r\n--test\r\nContent-Disposition: form-data; name=\"audio\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\naudio-data\r\n--test--\r\n";
@@ -1433,10 +1296,9 @@ mod tests {
             .unwrap();
         let s = State {
             root,
-            transcriber: Transcriber::from_env(),
-            agents: Agents::from_env(),
             overlay: Overlay::new(),
             jobs: Arc::new(Mutex::new(())),
+            gemini: Arc::new(crate::gemini::Service::new().unwrap()),
         };
         let r = Recording {
             id,
@@ -1444,6 +1306,7 @@ mod tests {
             created_at: chrono::Utc::now().to_rfc3339(),
             status: "transcribed".into(),
             transcript: "Maya will send the proposal Friday.".into(),
+            gemini_processed: 0,
             notes: "# Summary\nProposal agreed.".into(),
             error: None,
             pinned: false,

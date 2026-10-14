@@ -13,7 +13,8 @@ if [ ! -x "$compiler/bin/x86_64-w64-mingw32-clang" ]; then tar -xf "$tools/llvm-
 curl --fail --silent --show-error --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/llvm/llvm-project/main/llvm/LICENSE.TXT -o "$tools/llvm-LICENSE.txt"
 rustup target add x86_64-pc-windows-gnullvm
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER="$compiler/bin/x86_64-w64-mingw32-clang"
+export CC_x86_64_pc_windows_gnullvm="$compiler/bin/x86_64-w64-mingw32-clang"
+export AR_x86_64_pc_windows_gnullvm="$compiler/bin/llvm-ar"
 cd /workspace/openairecorder
 cargo build --locked --release --target x86_64-pc-windows-gnullvm -j 3
-bash scripts/build-whisper-windows.sh
 python scripts/package-windows.py

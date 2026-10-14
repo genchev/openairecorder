@@ -1,11 +1,8 @@
-use crate::design::{self, ACCENT};
-use crate::{
-    agent::Availability,
-    app::{
-        self,
-        desktop_api::{self, Command, Outcome, Snapshot},
-    },
+use crate::app::{
+    self,
+    desktop_api::{self, Command, Outcome, Snapshot},
 };
+use crate::design::{self, ACCENT};
 use eframe::egui;
 use std::{
     collections::VecDeque,
@@ -14,23 +11,16 @@ use std::{
 };
 use uuid::Uuid;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum View {
     New,
     Session(Uuid),
     Actions,
     Settings,
 }
-#[derive(Default)]
-struct Tools {
-    speech: bool,
-    codex: Availability,
-    claude: Availability,
-    checked: bool,
-}
 enum Message {
     Snapshot(u64, Result<Snapshot, String>, Option<(Uuid, String)>),
-    Tools(Tools),
+    GeminiCheck(Result<(Vec<String>, bool), String>, bool),
     Finished(Result<Outcome, String>),
     #[cfg_attr(not(windows), allow(dead_code))]
     Notice(String),
@@ -41,21 +31,24 @@ pub struct Desktop {
     sender: mpsc::Sender<Message>,
     receiver: mpsc::Receiver<Message>,
     data: Snapshot,
-    tools: Tools,
+    gemini_settings: crate::gemini::Settings,
+    gemini_key: String,
+    gemini_models: Vec<String>,
+    gemini_checking: bool,
+    gemini_configured: bool,
+    preview_paused: bool,
     view: View,
     search: String,
     title: String,
     system_audio: bool,
     mic: bool,
     permission: bool,
-    provider: String,
-    ai_consent: bool,
+
     session_tab: usize,
     markdown_cache: egui_commonmark::CommonMarkCache,
     #[cfg(not(windows))]
     markdown_path: String,
-    speech_language: String,
-    speech_model: String,
+
     notes_edit: String,
     notes_dirty: bool,
     output: String,
@@ -77,7 +70,7 @@ pub struct Desktop {
     #[cfg(windows)]
     capture: Option<crate::capture::Capture>,
     #[cfg(windows)]
-    recording_title: String,
+    recording_id: Option<Uuid>,
     #[cfg(windows)]
     recording_warning: String,
     #[cfg(windows)]
@@ -105,28 +98,33 @@ impl Desktop {
         ctx.set_theme(egui::ThemePreference::System);
         let recovery = runtime.block_on(desktop_api::recover(&state));
         let (sender, receiver) = mpsc::channel();
-        let speech = crate::transcription::SpeechSettings::load(&state.root);
+        let gemini_key = crate::secrets::load(&state.root).unwrap_or_default();
+        let gemini_settings = crate::gemini::Settings::load(&state.root);
+        let gemini_configured = !gemini_key.is_empty() && gemini_settings.validate().is_ok();
         let mut result = Self {
             state,
             runtime,
             sender,
             receiver,
             data: Snapshot::default(),
-            tools: Tools::default(),
+            gemini_models: vec![gemini_settings.audio_model.clone()],
+            gemini_settings,
+            gemini_key,
+            gemini_checking: false,
+            gemini_configured,
+            preview_paused: false,
             view: View::New,
             search: String::new(),
             title: String::new(),
             system_audio: true,
             mic: true,
             permission: false,
-            provider: String::new(),
-            ai_consent: false,
+
             session_tab: 0,
             markdown_cache: egui_commonmark::CommonMarkCache::default(),
             #[cfg(not(windows))]
             markdown_path: String::new(),
-            speech_language: speech.language,
-            speech_model: speech.model,
+
             notes_edit: String::new(),
             notes_dirty: false,
             output: String::new(),
@@ -148,7 +146,7 @@ impl Desktop {
             #[cfg(windows)]
             capture: None,
             #[cfg(windows)]
-            recording_title: String::new(),
+            recording_id: None,
             #[cfg(windows)]
             recording_warning: String::new(),
             #[cfg(windows)]
@@ -161,26 +159,35 @@ impl Desktop {
             ),
             Err(error) => format!("Cannot check recording recovery: {error}"),
         };
-        result.check_tools(ctx);
+
         result.refresh(ctx);
         result
     }
-    fn check_tools(&self, ctx: &egui::Context) {
+    fn check_gemini(&mut self, ctx: &egui::Context, test_audio: bool) {
+        if self.gemini_checking {
+            return;
+        }
+        self.gemini_checking = true;
         let state = self.state.clone();
         let sender = self.sender.clone();
         let ctx = ctx.clone();
+        let key = self.gemini_key.clone();
+        let settings = self.gemini_settings.clone();
         self.runtime.spawn(async move {
-            let (speech, codex, claude) = tokio::join!(
-                state.transcriber.available(&state.root),
-                state.agents.detect("codex"),
-                state.agents.detect("claude")
-            );
-            let _ = sender.send(Message::Tools(Tools {
-                speech,
-                codex,
-                claude,
-                checked: true,
-            }));
+            let result = if test_audio {
+                state.gemini.client.check(&key, &settings).await
+            } else {
+                state
+                    .gemini
+                    .client
+                    .models(&key)
+                    .await
+                    .map(|models| (models, false))
+            };
+            let _ = sender.send(Message::GeminiCheck(
+                result.map_err(|e| e.to_string()),
+                test_audio,
+            ));
             ctx.request_repaint();
         });
     }
@@ -230,7 +237,6 @@ impl Desktop {
         self.stop_playback();
         self.view = view;
         self.session_tab = 0;
-        self.ai_consent = false;
         self.output.clear();
         if let View::Session(id) = view {
             self.notes_edit = self
@@ -280,21 +286,33 @@ impl Desktop {
                 return;
             }
             self.stop_playback();
-            self.recording_title = self.title.clone();
+            let id = match self
+                .runtime
+                .block_on(crate::gemini::create_live(&self.state, &self.title))
+            {
+                Ok(id) => id,
+                Err(error) => {
+                    self.notice = error.to_string();
+                    return;
+                }
+            };
+            self.recording_id = Some(id);
+            self.runtime
+                .block_on(self.state.gemini.start(self.state.clone(), id));
             self.recording_warning.clear();
-            let path = self
-                .state
-                .root
-                .join(format!(".capture-{}.wav", Uuid::new_v4()));
-            let ctx = ctx.clone();
+            let path = self.state.root.join(id.to_string()).join("audio");
+            let wake_ctx = ctx.clone();
             self.capture = Some(crate::capture::Capture::start(
                 path,
                 self.system_audio,
                 self.mic,
                 self.state.overlay.clone(),
-                move || ctx.request_repaint(),
+                move || wake_ctx.request_repaint(),
             ));
-            self.notice = "Starting native Windows audio capture…".into();
+            self.navigate(View::Session(id));
+            self.notice =
+                "Recording starts now. Gemini receives each completed minute automatically.".into();
+            self.refresh(ctx);
         }
         #[cfg(not(windows))]
         {
@@ -311,10 +329,7 @@ impl Desktop {
     fn import(&mut self, ctx: &egui::Context) {
         #[cfg(windows)]
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter(
-                "Audio or video",
-                &["wav", "mp3", "m4a", "mp4", "webm", "ogg", "opus", "flac"],
-            )
+            .add_filter("PCM WAV recording", &["wav"])
             .pick_file()
         {
             let title = if self.title.trim().is_empty() {
@@ -385,18 +400,21 @@ impl Desktop {
     fn poll(&mut self, ctx: &egui::Context) {
         while let Ok(message) = self.receiver.try_recv() {
             match message {
-                Message::Tools(tools) => {
-                    if self.provider.is_empty() {
-                        self.provider = if tools.codex.installed {
-                            "codex"
-                        } else if tools.claude.installed {
-                            "claude"
-                        } else {
-                            ""
+                Message::GeminiCheck(result, test_audio) => {
+                    self.gemini_checking = false;
+                    match result {
+                        Ok((models, needs_notes)) => {
+                            self.gemini_models = models;
+                            if needs_notes {
+                                self.gemini_settings.separate_notes = true;
+                                self.gemini_settings.notes_model.clear();
+                                self.notice="Audio input works, but structured notes need a separate model. Choose a notes model below, then test and save.".into();
+                                continue;
+                            }
+                            self.notice=if test_audio {"Gemini audio and structured Markdown notes verified. Save settings to use these models."}else{"Available Gemini models loaded. Audio support is checked by Test audio & notes."}.into();
                         }
-                        .into();
+                        Err(error) => self.notice = error,
                     }
-                    self.tools = tools;
                 }
                 Message::Notice(value) => self.notice = value,
                 Message::Snapshot(epoch, result, output) => {
@@ -439,8 +457,9 @@ impl Desktop {
                                 self.notes_dirty = false;
                             }
                             self.notice = outcome.message;
-                            if self.notice == "Speech preferences saved" {
-                                self.check_tools(ctx);
+                            if self.notice == "Gemini settings saved" {
+                                self.gemini_configured = !self.gemini_key.trim().is_empty()
+                                    && self.gemini_settings.validate().is_ok();
                             }
                             if let Some(file) = outcome.file {
                                 #[cfg(windows)]
@@ -477,21 +496,33 @@ impl Desktop {
                 self.capture.take();
                 match result {
                     Ok(record) => {
-                        self.recording_warning = record.warning.unwrap_or_default();
-                        self.dispatch(
-                            Command::Import {
-                                path: record.path,
-                                title: self.recording_title.clone(),
-                                owned_capture: true,
-                            },
-                            ctx,
-                        );
+                        self.recording_warning = record.warning.clone().unwrap_or_default();
+                        if let Some(id) = self.recording_id.take() {
+                            self.dispatch(
+                                Command::FinishLive {
+                                    id,
+                                    total: record.chunks,
+                                    warning: record.warning,
+                                },
+                                ctx,
+                            );
+                        }
                     }
                     Err(error) => {
                         self.notice = format!(
                             "Recording failed: {error}. Any recovery audio remains in the data folder."
                         );
                         self.closing = false;
+                        if let Some(id) = self.recording_id.take() {
+                            self.dispatch(
+                                Command::FinishLive {
+                                    id,
+                                    total: 0,
+                                    warning: Some(error.to_string()),
+                                },
+                                ctx,
+                            );
+                        }
                     }
                 }
             }
@@ -749,7 +780,7 @@ impl Desktop {
             )
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
-                    .id_salt("content-scroll")
+                    .id_salt(("content-scroll", self.view, self.session_tab))
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         match self.view {
@@ -842,13 +873,14 @@ impl Desktop {
             );
             ui.checkbox(
                 &mut self.permission,
-                "Everyone in this conversation knows I'm recording.",
+                "Everyone knows I'm recording and sending the audio to Gemini.",
             );
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
                 if ui
                     .add_enabled(
                         cfg!(windows)
+                            && self.gemini_configured
                             && self.permission
                             && (self.system_audio || self.mic)
                             && !self.recording()
@@ -859,8 +891,11 @@ impl Desktop {
                 {
                     self.begin_capture(ctx);
                 }
-                design::subtitle(ui, "Pause anytime. Floating controls stay within reach.");
+                design::subtitle(ui, "Audio goes to Gemini every minute. Pause anytime.");
             });
+            if !self.gemini_configured && ui.button("Set up Gemini").clicked() {
+                self.navigate(View::Settings);
+            }
             #[cfg(not(windows))]
             design::subtitle(
                 ui,
@@ -1019,21 +1054,55 @@ impl Desktop {
             ui.colored_label(egui::Color32::from_rgb(207, 92, 104), error);
         }
         ui.add_space(18.0);
+        if let Some((pending, finished, error)) =
+            crate::gemini::status(&self.state.root, id, r.gemini_processed)
+        {
+            ui.horizontal_wrapped(|ui| {
+                design::pill(
+                    ui,
+                    if !finished {
+                        "LIVE GEMINI"
+                    } else if pending > 0 {
+                        "SYNCING"
+                    } else {
+                        "UP TO DATE"
+                    },
+                    ACCENT,
+                );
+                design::subtitle(
+                    ui,
+                    &format!(
+                        "{} segments processed · {pending} pending",
+                        r.gemini_processed
+                    ),
+                );
+                if (error.is_some() || pending > 0 && !self.state.gemini.is_running(id))
+                    && ui
+                        .add_enabled(!self.busy, egui::Button::new("Retry pending audio"))
+                        .clicked()
+                {
+                    self.dispatch(Command::RetryGemini(id), ctx);
+                }
+            });
+            if let Some(error) = error {
+                ui.colored_label(egui::Color32::from_rgb(210, 100, 110), error);
+            }
+        }
         design::card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
                 if ui
                     .add_enabled(
-                        !busy && self.tools.speech,
+                        !busy && r.status != "recording" && self.gemini_configured,
                         design::primary(if r.transcript.is_empty() {
-                            "Create transcript"
+                            "Process with Gemini"
                         } else {
-                            "Refresh transcript"
+                            "Continue Gemini processing"
                         }),
                     )
                     .clicked()
                 {
-                    self.dispatch(Command::Transcribe(id), ctx);
+                    self.dispatch(Command::ProcessGemini(id), ctx);
                 }
                 if ui
                     .add_enabled(
@@ -1050,7 +1119,10 @@ impl Desktop {
                     self.stop_playback();
                 }
                 if ui
-                    .add_enabled(!busy, egui::Button::new("Import Markdown…"))
+                    .add_enabled(
+                        !busy && r.status != "recording",
+                        egui::Button::new("Import Markdown…"),
+                    )
                     .clicked()
                 {
                     self.import_markdown(id, ctx);
@@ -1064,11 +1136,8 @@ impl Desktop {
                 egui::TextEdit::singleline(&mut self.markdown_path)
                     .hint_text("Returned Markdown path (preview)"),
             );
-            if !self.tools.speech {
-                design::subtitle(
-                    ui,
-                    "Speech engine is not ready. Check Settings for its status.",
-                );
+            if !self.gemini_configured {
+                design::subtitle(ui, "Configure a Gemini API key and models in Settings.");
             }
             if busy {
                 ui.horizontal(|ui| {
@@ -1118,7 +1187,7 @@ impl Desktop {
             }
             1 => self.session_actions(ui, ctx, &r, busy),
             2 => {
-                design::card(ui).show(ui,|ui|{ui.set_width(ui.available_width());ui.heading("Full transcript");ui.add_space(8.0);if r.transcript.is_empty(){design::subtitle(ui,"Create a transcript or import a Markdown document with a Full transcript section.");}else{egui_commonmark::CommonMarkViewer::new().show(ui,&mut self.markdown_cache,&r.transcript);ui.add_space(12.0);if ui.button("Copy transcript").clicked(){ctx.copy_text(r.transcript.clone());}
+                design::card(ui).show(ui,|ui|{ui.set_width(ui.available_width());ui.heading("Full transcript");ui.add_space(8.0);if r.transcript.is_empty(){design::subtitle(ui,"Gemini adds each minute here as it is processed. Language is detected automatically.");}else{egui_commonmark::CommonMarkViewer::new().show(ui,&mut self.markdown_cache,&r.transcript);ui.add_space(12.0);if ui.button("Copy transcript").clicked(){ctx.copy_text(r.transcript.clone());}
 if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
             }
             _ => self.audio_ai_panel(ui, ctx, &r, busy),
@@ -1126,7 +1195,10 @@ if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
         ui.add_space(20.0);
         egui::CollapsingHeader::new("Session options").show(ui, |ui| {
             if ui
-                .add_enabled(!busy, egui::Button::new("Delete conversation…"))
+                .add_enabled(
+                    !busy && r.status != "recording",
+                    egui::Button::new("Delete conversation…"),
+                )
                 .clicked()
             {
                 self.delete_confirm = Some(id);
@@ -1140,23 +1212,72 @@ if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
         r: &app::Recording,
         busy: bool,
     ) {
-        design::card(ui).show(ui,|ui|{
+        design::card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.heading("Notes & decisions");ui.add_space(12.0);
-            if r.notes.is_empty(){
-                ui.add_space(12.0);ui.label(egui::RichText::new("From conversation to clarity.").size(21.0).strong());
-                design::subtitle(ui,"Create a transcript, then let your signed-in agent turn it into notes and next steps.");
-                if ui.add(design::primary("Set up AI notes")).clicked(){self.session_tab=3;}
+            ui.heading("Notes & decisions");
+            ui.add_space(12.0);
+            if r.notes.is_empty() {
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new("From conversation to clarity.")
+                        .size(21.0)
+                        .strong(),
+                );
+                design::subtitle(
+                    ui,
+                    "Gemini will add notes and decisions after the first minute is processed.",
+                );
+                if ui.add(design::primary("Gemini processing")).clicked() {
+                    self.session_tab = 3;
+                }
                 ui.add_space(16.0);
-            }else{
-                let mut document=r.notes.clone();
-                let response=egui_commonmark::CommonMarkViewer::new().show_mut(ui,&mut self.markdown_cache,&mut document);
-                if response.response.changed()&&!busy{self.dispatch(Command::Notes{id:r.id,notes:document},ctx);}
+            } else {
+                let mut document = r.notes.clone();
+                let response = ui
+                    .add_enabled_ui(!busy && r.status != "recording", |ui| {
+                        egui_commonmark::CommonMarkViewer::new().show_mut(
+                            ui,
+                            &mut self.markdown_cache,
+                            &mut document,
+                        )
+                    })
+                    .inner;
+                if response.response.changed() && !busy && r.status != "recording" {
+                    self.dispatch(
+                        Command::Notes {
+                            id: r.id,
+                            notes: document,
+                        },
+                        ctx,
+                    );
+                }
             }
             ui.add_space(12.0);
-            egui::CollapsingHeader::new("Edit Markdown").show(ui,|ui|{
-                self.notes_dirty|=ui.add(egui::TextEdit::multiline(&mut self.notes_edit).desired_width(f32::INFINITY).desired_rows(14).font(egui::TextStyle::Monospace)).changed();
-                if ui.add_enabled(!busy&&self.notes_dirty,design::primary("Save changes")).clicked(){self.dispatch(Command::Notes{id:r.id,notes:self.notes_edit.clone()},ctx);self.notes_save_pending=true;}
+            egui::CollapsingHeader::new("Edit Markdown").show(ui, |ui| {
+                self.notes_dirty |= ui
+                    .add(
+                        egui::TextEdit::multiline(&mut self.notes_edit)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(14)
+                            .font(egui::TextStyle::Monospace),
+                    )
+                    .changed();
+                if ui
+                    .add_enabled(
+                        !busy && r.status != "recording" && self.notes_dirty,
+                        design::primary("Save changes"),
+                    )
+                    .clicked()
+                {
+                    self.dispatch(
+                        Command::Notes {
+                            id: r.id,
+                            notes: self.notes_edit.clone(),
+                        },
+                        ctx,
+                    );
+                    self.notes_save_pending = true;
+                }
             });
         });
     }
@@ -1194,36 +1315,15 @@ if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
         busy: bool,
     ) {
         design::card(ui).show(ui,|ui|{
-            ui.set_width(ui.available_width());design::eyebrow(ui,"YOUR SUBSCRIPTION");ui.heading("Turn the transcript into notes");
-            design::subtitle(ui,"Whisper handles speech locally. Your chosen agent receives the transcript when you generate notes.");
-            ui.add_space(10.0);
-            ui.horizontal_wrapped(|ui|{
-                for (key,label,installed) in [("codex","Codex / ChatGPT",self.tools.codex.installed),("claude","Claude Code",self.tools.claude.installed)]{
-                    if ui.add_enabled(installed,egui::Button::new(label).selected(self.provider==key)).clicked(){self.provider=key.into();}
-                }
-            });
-            if !self.tools.codex.installed&&!self.tools.claude.installed{design::subtitle(ui,"No subscription agent detected. Settings links to the official installers.");}
-            ui.checkbox(&mut self.ai_consent,"Share this transcript with my selected agent.");
-            if ui.add_enabled(!busy&&!r.transcript.is_empty()&&!self.provider.is_empty()&&self.ai_consent,design::primary("Generate notes & actions")).clicked(){self.dispatch(Command::Generate{id:r.id,provider:self.provider.clone(),consent:true},ctx);}
-            if r.transcript.is_empty(){design::subtitle(ui,"Create a transcript first.");}
-            ui.add_space(12.0);
-            egui::CollapsingHeader::new("Agent activity").show(ui,|ui|{
-                if self.output.trim().is_empty(){design::subtitle(ui,"Agent output will appear here.");}else{let mut text=self.output.as_str();ui.add(egui::TextEdit::multiline(&mut text).desired_width(f32::INFINITY).desired_rows(12).font(egui::TextStyle::Monospace));}
-            });
-        });
-        ui.add_space(18.0);
-        design::card(ui).show(ui,|ui|{
-            ui.set_width(ui.available_width());ui.heading("Use another audio service");
-            design::subtitle(ui,"Export the original audio and a ready-to-copy prompt. Use a service with audio support, then bring its Markdown back here.");
-            ui.horizontal_wrapped(|ui|{
-                if ui.add_enabled(!busy,egui::Button::new("Prepare audio folder")).clicked(){self.dispatch(Command::PrepareAudio(r.id),ctx);}
-                if ui.button("Open audio folder").clicked(){self.open_folder(self.state.root.join(r.id.to_string()).join("audio-handoff"));}
-                if ui.button("Copy audio prompt").clicked(){ctx.copy_text(crate::document::audio_prompt().into());}
-            });
-            design::subtitle(ui,"Codex CLI and Claude Code do not accept audio attachments directly.");
-            if ui.add_enabled(!busy,egui::Button::new("Import returned Markdown…")).clicked(){self.import_markdown(r.id,ctx);}
-            design::subtitle(ui,"Or save agent-output.md in this session's folder; the app imports changes automatically.");
-            if ui.small_button("Open session folder").clicked(){self.open_folder(self.state.root.join(r.id.to_string()));}
+            ui.set_width(ui.available_width());ui.heading("Gemini audio processing");
+            design::subtitle(ui,"Audio is sent in one-minute batches while recording. Language is detected automatically; notes, decisions, transcript and action items update after each response.");
+            let settings=crate::gemini::models_for_session(&self.state.root,r.id);
+            ui.label(format!("Audio model: {}",settings.audio_model));
+            ui.label(format!("Notes model: {}",if settings.separate_notes{&settings.notes_model}else{&settings.audio_model}));
+            design::subtitle(ui,"Pause omits new audio; queued parts may still finish. Stop also sends the final partial minute. Failed segments remain on disk for retry.");
+            if r.status!="recording"&&ui.add_enabled(!busy&&self.gemini_configured&&!self.state.gemini.is_running(r.id),design::primary("Process pending audio")).clicked(){self.dispatch(Command::ProcessGemini(r.id),ctx);}
+            if ui.button("Gemini settings").clicked(){self.navigate(View::Settings);}
+            if ui.button("Open session folder").clicked(){self.open_folder(self.state.root.join(r.id.to_string()));}
         });
     }
     fn open_folder(&mut self, path: std::path::PathBuf) {
@@ -1376,29 +1476,35 @@ if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
         });
         ui.add_space(18.0);
         design::card(ui).show(ui,|ui|{
-            ui.set_width(ui.available_width());ui.heading("Speech recognition");
-            design::pill(ui,if !self.tools.checked{"CHECKING"}else if self.tools.speech{"WHISPER READY"}else{"NOT READY"},ACCENT);
-            design::subtitle(ui,"Speech is processed on your computer. Set Bulgarian explicitly for Bulgarian conversations.");
-            ui.add_space(8.0);
+            ui.set_width(ui.available_width());ui.heading("Gemini API");
+            design::subtitle(ui,"On Windows, your key is encrypted for your account. Audio and meeting context are sent to Google; API usage is billed according to your model and account.");
+            ui.add_space(8.0);design::eyebrow(ui,"API KEY");
+            ui.add_sized([ui.available_width(),42.0],egui::TextEdit::singleline(&mut self.gemini_key).password(true).hint_text("Paste your Gemini API key").margin(egui::vec2(12.0,11.0)));
+            if ui.link("Get a key in Google AI Studio").clicked(){ctx.open_url(egui::OpenUrl::new_tab("https://aistudio.google.com/apikey"));}
+            ui.add_space(10.0);design::eyebrow(ui,"AUDIO → TEXT MODEL");
+            model_picker(ui,"gemini-audio",&mut self.gemini_settings.audio_model,&self.gemini_models);
+            design::subtitle(ui,"Choose a model with audio input. Gemini text models can return Markdown; by default one model handles both audio and notes.");
+            ui.checkbox(&mut self.gemini_settings.separate_notes,"Use a separate model for notes and actions");
+            if self.gemini_settings.separate_notes {
+                design::eyebrow(ui,"NOTES MODEL (REQUIRED)");model_picker(ui,"gemini-notes",&mut self.gemini_settings.notes_model,&self.gemini_models);
+            }
             ui.horizontal_wrapped(|ui|{
-                for (key,name) in [("bg","Bulgarian"),("en","English"),("auto","Auto-detect")]{
-                    if ui.add_enabled(!self.busy,egui::Button::new(name).selected(self.speech_language==key)).clicked(){self.speech_language=key.into();self.save_speech_settings(ctx);}
-                }
+                if ui.add_enabled(!self.gemini_checking&&!self.gemini_key.trim().is_empty(),egui::Button::new("Refresh available models")).clicked(){self.check_gemini(ctx,false);}
+                if ui.add_enabled(!self.gemini_checking&&!self.gemini_key.trim().is_empty()&&self.gemini_settings.validate().is_ok(),egui::Button::new("Test audio & notes")).clicked(){self.check_gemini(ctx,true);}
+                if self.gemini_checking{ui.spinner();}
             });
-            design::subtitle(ui,"The bundled tiny model favors speed. A multilingual small or medium model can improve Bulgarian accuracy.");
-            #[cfg(windows)] if ui.button("Choose a Whisper model…").clicked() && let Some(path)=rfd::FileDialog::new().add_filter("Whisper model",&["bin"]).pick_file(){self.speech_model=path.display().to_string();self.save_speech_settings(ctx);}
-            if !self.speech_model.is_empty(){design::subtitle(ui,&self.speech_model);if ui.button("Use bundled model").clicked(){self.speech_model.clear();self.save_speech_settings(ctx);}}
-            if ui.link("Download multilingual models").clicked(){ctx.open_url(egui::OpenUrl::new_tab("https://huggingface.co/ggerganov/whisper.cpp/tree/main"));}
+            design::subtitle(ui,"The test sends one second of generated silence to verify audio and structured notes support. It is an API request. If your audio model cannot generate structured notes, select a compatible separate notes model and test again.");
+            ui.add_space(10.0);
+            if ui.add_enabled(!self.busy&&self.gemini_settings.validate().is_ok(),design::primary("Save Gemini settings")).clicked(){self.dispatch(Command::GeminiSettings{settings:self.gemini_settings.clone(),key:self.gemini_key.clone()},ctx);}
+            design::pill(ui,"AUTOMATIC LANGUAGE DETECTION · 60-SECOND AUDIO BATCHES",ACCENT);
+            design::subtitle(ui,"Model changes apply to new recordings and explicit retries. An empty key removes the saved key. Closing the app preserves pending audio for the next launch.");
         });
         ui.add_space(18.0);
-        design::card(ui).show(ui,|ui|{
-            ui.set_width(ui.available_width());ui.heading("Subscription agents");design::subtitle(ui,"Connect an installed agent using its own subscription login. No API keys are required here.");ui.add_space(10.0);
-            for (name,info,url) in [("Codex / ChatGPT",&self.tools.codex,"https://developers.openai.com/codex/cli/"),("Claude Code",&self.tools.claude,"https://code.claude.com/docs/en/setup")]{
-                ui.horizontal_wrapped(|ui|{ui.strong(name);design::pill(ui,if info.installed{"DETECTED"}else{"NOT INSTALLED"},if info.installed{egui::Color32::from_rgb(49,158,125)}else{design::muted(ui)});if ui.link("Official setup guide").clicked(){ctx.open_url(egui::OpenUrl::new_tab(url));}});
-                if let Some(version)=&info.version{design::subtitle(ui,version);}
-                ui.add_space(8.0);
-            }
-            if ui.button("Check tools again").clicked(){self.check_tools(ctx);}
+        design::card(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());ui.heading("Discreet recording controls");
+            design::subtitle(ui,"A small floating strip stays above your windows. Drag it to move; use the small pause and stop buttons.");
+            ui.add_space(8.0);recorder_preview(ui,&mut self.preview_paused);
+            design::subtitle(ui,"Design preview. Green bars indicate locally detected speech; paused recording has no speech indicator.");
         });
         ui.add_space(18.0);
         design::card(ui).show(ui, |ui| {
@@ -1414,16 +1520,6 @@ if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
             }
         });
     }
-    fn save_speech_settings(&mut self, ctx: &egui::Context) {
-        self.dispatch(
-            Command::SpeechSettings {
-                language: self.speech_language.clone(),
-                model: self.speech_model.clone(),
-            },
-            ctx,
-        );
-    }
-
     fn dialogs(&mut self, ctx: &egui::Context) {
         if self.pending_navigation.is_some() {
             egui::Window::new("Unsaved notes")
@@ -1469,18 +1565,121 @@ impl Drop for Desktop {
         #[cfg(windows)]
         if let Some(mut capture) = self.capture.take()
             && let Some(Ok(result)) = capture.finish()
+            && let Some(id) = self.recording_id.take()
         {
-            let _ = self.runtime.block_on(desktop_api::execute(
+            let _ = self.runtime.block_on(crate::gemini::finish_live(
                 &self.state,
-                Command::Import {
-                    path: result.path,
-                    title: self.recording_title.clone(),
-                    owned_capture: true,
-                },
+                id,
+                result.chunks,
+                result.warning,
             ));
         }
         self.state.overlay.hide();
     }
+}
+fn recorder_preview(ui: &mut egui::Ui, paused: &mut bool) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(234.0, 52.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, 9, egui::Color32::from_rgb(25, 27, 38));
+    ui.painter().circle_filled(
+        rect.min + egui::vec2(16.0, 26.0),
+        4.0,
+        if *paused {
+            egui::Color32::from_rgb(237, 198, 110)
+        } else {
+            ACCENT
+        },
+    );
+    ui.painter().text(
+        rect.min + egui::vec2(29.0, 26.0),
+        egui::Align2::LEFT_CENTER,
+        "00:42",
+        egui::FontId::proportional(16.0),
+        egui::Color32::from_rgb(238, 240, 247),
+    );
+    for (i, h) in [8.0, 17.0, 11.0].iter().enumerate() {
+        let height = if *paused { 3.0 } else { *h };
+        let bar = egui::Rect::from_center_size(
+            rect.min + egui::vec2(106.5 + i as f32 * 7.0, 26.0),
+            egui::vec2(3.0, height),
+        );
+        ui.painter().rect_filled(
+            bar,
+            2,
+            if *paused {
+                egui::Color32::from_rgb(74, 85, 111)
+            } else {
+                design::MINT
+            },
+        );
+    }
+    for (i, x) in [145.0, 187.0].iter().enumerate() {
+        let bounds =
+            egui::Rect::from_min_size(rect.min + egui::vec2(*x, 10.0), egui::vec2(32.0, 32.0));
+        let response = ui
+            .interact(
+                bounds,
+                ui.id().with(("recorder-preview", i)),
+                egui::Sense::click(),
+            )
+            .on_hover_text(if i == 0 {
+                "Pause / resume preview"
+            } else {
+                "Stop and save (preview only)"
+            });
+        ui.painter().rect_filled(
+            bounds,
+            5,
+            if response.hovered() {
+                egui::Color32::from_rgb(57, 69, 100)
+            } else {
+                egui::Color32::from_rgb(38, 43, 59)
+            },
+        );
+        ui.painter().text(
+            bounds.center(),
+            egui::Align2::CENTER_CENTER,
+            if i == 1 {
+                "■"
+            } else if *paused {
+                "▶"
+            } else {
+                "Ⅱ"
+            },
+            egui::FontId::proportional(17.0),
+            if i == 1 {
+                egui::Color32::from_rgb(245, 150, 168)
+            } else {
+                egui::Color32::WHITE
+            },
+        );
+        if response.clicked() && i == 0 {
+            *paused = !*paused;
+        }
+    }
+}
+fn model_picker(ui: &mut egui::Ui, id: &str, model: &mut String, models: &[String]) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(if model.is_empty() {
+            "Choose model"
+        } else {
+            model.as_str()
+        })
+        .width(290.0)
+        .show_ui(ui, |ui| {
+            for option in models {
+                ui.selectable_value(model, option.clone(), option);
+            }
+        });
+    egui::CollapsingHeader::new("Custom model ID")
+        .id_salt((id, "custom"))
+        .show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::singleline(model)
+                    .hint_text("Enter a model ID")
+                    .desired_width(340.0),
+            );
+        });
 }
 fn nav(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
     let fill = if selected {
@@ -1538,13 +1737,9 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let state = app::State {
             root: root.clone(),
-            transcriber: crate::transcription::Transcriber::from_env(),
-            agents: crate::agent::Agents {
-                codex: root.join("missing-codex"),
-                claude: root.join("missing-claude"),
-            },
             overlay: crate::overlay::Overlay::new(),
             jobs: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            gemini: std::sync::Arc::new(crate::gemini::Service::new().unwrap()),
         };
         let ctx = egui::Context::default();
         let mut app = Desktop::new(state, runtime.handle().clone(), &ctx);

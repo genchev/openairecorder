@@ -143,9 +143,54 @@ impl Mixer {
             .collect()
     }
 }
+/// WebRTC speech detection on 10 ms frames; retains a short hangover for a steady indicator.
+pub struct VoiceDetector {
+    vad: webrtc_vad::Vad,
+    pending: VecDeque<i16>,
+    hold: usize,
+}
+impl VoiceDetector {
+    pub fn new() -> Self {
+        Self {
+            vad: webrtc_vad::Vad::new_with_rate_and_mode(
+                webrtc_vad::SampleRate::Rate16kHz,
+                webrtc_vad::VadMode::Aggressive,
+            ),
+            pending: VecDeque::new(),
+            hold: 0,
+        }
+    }
+    pub fn push(&mut self, samples: &[i16]) -> bool {
+        self.pending.extend(samples);
+        while self.pending.len() >= 160 {
+            let frame: Vec<_> = self.pending.drain(..160).collect();
+            if self.vad.is_voice_segment(&frame).unwrap_or(false) {
+                self.hold = 4800;
+            } else {
+                self.hold = self.hold.saturating_sub(160);
+            }
+        }
+        self.hold > 0
+    }
+    pub fn pause(&mut self) {
+        self.pending.clear();
+        self.hold = 0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn speech_indicator_handles_partial_frames_and_silence() {
+        let mut vad = VoiceDetector::new();
+        assert!(!vad.push(&[]));
+        assert!(!vad.push(&[0; 3]));
+        assert!(!vad.push(&[0; 157]));
+        assert!(!vad.push(&[0; 32000]));
+        vad.pause();
+        assert!(!vad.push(&[0; 160]));
+    }
     #[test]
     fn resampling_is_independent_of_callback_boundaries() {
         let input: Vec<_> = (0..4800).map(|i| (i as f32 * 0.1).sin()).collect();

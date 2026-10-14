@@ -1,5 +1,4 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
-mod agent;
 mod app;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod audio;
@@ -8,10 +7,12 @@ mod capture;
 mod design;
 mod desktop;
 mod document;
+mod gemini;
 mod overlay;
 #[cfg(windows)]
 mod playback;
-mod transcription;
+mod secrets;
+mod segments;
 
 fn main() -> anyhow::Result<()> {
     let result = start();
@@ -36,7 +37,7 @@ fn main() -> anyhow::Result<()> {
 }
 fn start() -> anyhow::Result<()> {
     let web = std::env::args().any(|a| a == "--web");
-    let native = cfg!(windows) && !web || std::env::args().any(|a| a == "--desktop");
+    let native = !web || std::env::args().any(|a| a == "--desktop");
     #[cfg(windows)]
     let _instance = if native {
         Some(single_instance()?)
