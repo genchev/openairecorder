@@ -9,25 +9,35 @@ compiler = tools / 'llvm-mingw-20261006-ucrt-ubuntu-22.04-x86_64'
 whisper = tools / 'whisper-windows-v1.8.7.zip'
 assert hashlib.sha256(whisper.read_bytes()).hexdigest() == 'd9627486e1c34a03745880485593473e047294260ce9a3cb0aa8deaf15b99af6'
 assert hashlib.sha256((tools / 'llvm-mingw.tar.xz').read_bytes()).hexdigest() == '5f9c6ed95b2d4bdb2869a488c5fd5857fbdabcf288a0aa3eb1da43f6a08d8ab4'
-output = repo / 'dist' / 'OpenAIRecorder-Windows-x64.zip'
+output = repo / 'dist' / 'OpenAIRecorder-Native-Windows-x64.zip'
 output.parent.mkdir(exist_ok=True)
 prefix = 'OpenAIRecorder'
-with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED, strict_timestamps=False) as archive:
     archive.write(repo / 'target/x86_64-pc-windows-gnullvm/release/openairecorder.exe', f'{prefix}/openairecorder.exe')
     archive.write(compiler / 'x86_64-w64-mingw32/bin/libunwind.dll', f'{prefix}/libunwind.dll')
     archive.write(tools / 'llvm-LICENSE.txt', f'{prefix}/licenses/LLVM.txt')
     archive.write(compiler / 'x86_64-w64-mingw32/share/mingw32/COPYING', f'{prefix}/licenses/mingw-w64.txt')
     archive.write(tools / 'whisper.cpp/LICENSE', f'{prefix}/licenses/whisper.cpp.txt')
-    for name in ['README.md', 'scripts/setup-windows.ps1', 'scripts/start-windows.ps1']:
+    for name in ['README.md', 'VALIDATION.md', 'scripts/setup-windows.ps1', 'scripts/start-windows.ps1']:
         archive.write(repo / name, f'{prefix}/{name}')
     with zipfile.ZipFile(whisper) as binaries:
         for name in ['whisper-cli.exe', 'whisper.dll', 'ggml.dll', 'ggml-base.dll', 'ggml-cpu.dll']:
             archive.writestr(f'{prefix}/.local-tools/whisper/Release/{name}', binaries.read(f'Release/{name}'))
+    registry = tools / 'cargo/registry/src'
+    import tomllib
+    dependencies = {(entry['name'], entry['version']) for entry in tomllib.loads((repo / 'Cargo.lock').read_text())['package']}
+    for index in registry.iterdir():
+        if not index.is_dir(): continue
+        for crate in index.iterdir():
+            if not any(crate.name == f'{name}-{version}' for name, version in dependencies): continue
+            for license_file in crate.rglob('*'):
+                if license_file.is_file() and any(word in license_file.name.lower() for word in ['license','copying','copyright']) and license_file.stat().st_size < 300_000:
+                    archive.write(license_file, f'{prefix}/licenses/rust-dependencies/{crate.name}/{license_file.relative_to(crate)}')
     model = tools / 'whisper.cpp/models/ggml-tiny.bin'
     if model.is_file():
         assert hashlib.sha256(model.read_bytes()).hexdigest() == 'be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21'
         archive.write(model, f'{prefix}/.local-tools/ggml-tiny.bin')
-    archive.writestr(f'{prefix}/START-HERE.txt', '''OpenAIRecorder — Windows 10/11 x64 prototype
+    archive.writestr(f'{prefix}/START-HERE.txt', '''OpenAIRecorder 0.2 — Native Windows 10/11 x64 prototype
 
 1. Extract this whole folder to a writable location on your computer.
 2. In PowerShell install dependencies:
@@ -41,10 +51,15 @@ with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
    codex login
    OR: winget install --id Anthropic.ClaudeCode --exact
        claude auth login
-5. Run .\\scripts\\start-windows.ps1 (no Rust installation required).
-   The GUI opens in Edge/Chrome. Keep the server and GUI open during recording.
+5. Double-click openairecorder.exe (no Rust installation required).
+   This opens the native desktop GUI. No browser or localhost server is launched.
+   You can also use .\\scripts\\start-windows.ps1 from a fresh PowerShell.
+6. Start recording. Pause/Resume from the main window or floating widget keeps
+   the same recording open and excludes paused time from the audio/timer.
+   Stop saves it. The floating controls also work when the window is minimized.
 
-Notes and recordings stay in the recordings folder. The chosen CLI receives
+Data is stored under %LOCALAPPDATA%\\OpenAIRecorder\\recordings.
+Existing recordings next to the executable from the older version are reused. The chosen CLI receives
 transcript text only when you confirm generating notes. Subscription limits apply.
 
 This executable was cross-built on Linux. Native widget behavior and Windows

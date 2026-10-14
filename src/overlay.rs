@@ -1,12 +1,14 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 #[derive(Clone)]
 pub struct Overlay {
     pub active: Arc<AtomicBool>,
     pub stop: Arc<AtomicBool>,
+    pub pause: Arc<AtomicBool>,
+    pub elapsed_ms: Arc<AtomicU64>,
     sender: std::sync::mpsc::Sender<bool>,
 }
 impl Overlay {
@@ -14,10 +16,14 @@ impl Overlay {
         let (sender, receiver) = std::sync::mpsc::channel();
         let active = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
+        let pause = Arc::new(AtomicBool::new(false));
+        let elapsed_ms = Arc::new(AtomicU64::new(0));
         #[cfg(windows)]
         {
             let flag = stop.clone();
-            std::thread::spawn(move || windows_widget(receiver, flag));
+            let p = pause.clone();
+            let elapsed = elapsed_ms.clone();
+            std::thread::spawn(move || windows_widget(receiver, flag, p, elapsed));
         }
         #[cfg(not(windows))]
         {
@@ -26,6 +32,8 @@ impl Overlay {
         Self {
             active,
             stop,
+            pause,
+            elapsed_ms,
             sender,
         }
     }
@@ -38,6 +46,8 @@ impl Overlay {
             return false;
         }
         self.stop.store(false, Ordering::SeqCst);
+        self.pause.store(false, Ordering::SeqCst);
+        self.elapsed_ms.store(0, Ordering::SeqCst);
         let _ = self.sender.send(true);
         true
     }
@@ -48,21 +58,29 @@ impl Overlay {
 }
 
 #[cfg(windows)]
-fn windows_widget(receiver: std::sync::mpsc::Receiver<bool>, flag: Arc<AtomicBool>) {
-    use std::{
-        ptr::null,
-        ptr::null_mut,
-        time::{Duration, Instant},
-    };
+fn windows_widget(
+    receiver: std::sync::mpsc::Receiver<bool>,
+    flag: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
+    elapsed: Arc<AtomicU64>,
+) {
+    use std::{ptr::null, ptr::null_mut, time::Duration};
     use windows_sys::Win32::{
         Foundation::*, Graphics::Gdi::*, System::LibraryLoader::*, UI::WindowsAndMessaging::*,
     };
     static STOP: std::sync::OnceLock<Arc<AtomicBool>> = std::sync::OnceLock::new();
+    static PAUSE: std::sync::OnceLock<Arc<AtomicBool>> = std::sync::OnceLock::new();
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(Some(0)).collect()
     }
     unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         match msg {
+            WM_COMMAND if wp & 0xffff == 2 => {
+                if let Some(p) = PAUSE.get() {
+                    p.fetch_xor(true, Ordering::SeqCst);
+                }
+                0
+            }
             WM_COMMAND if wp & 0xffff == 1 => {
                 if let Some(s) = STOP.get() {
                     s.store(true, Ordering::SeqCst);
@@ -80,6 +98,7 @@ fn windows_widget(receiver: std::sync::mpsc::Receiver<bool>, flag: Arc<AtomicBoo
         }
     }
     let _ = STOP.set(flag);
+    let _ = PAUSE.set(pause.clone());
     unsafe {
         let instance = GetModuleHandleW(null());
         let class = wide("OpenAIRecorderOverlay");
@@ -134,19 +153,31 @@ fn windows_widget(receiver: std::sync::mpsc::Receiver<bool>, flag: Arc<AtomicBoo
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
             16,
             40,
-            255,
+            123,
             27,
             hwnd,
             1usize as HMENU,
             instance,
             null(),
         );
-        let mut started = Instant::now();
+        let pause_button = CreateWindowExW(
+            0,
+            wide("BUTTON").as_ptr(),
+            wide("Pause").as_ptr(),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            148,
+            40,
+            123,
+            27,
+            hwnd,
+            2usize as HMENU,
+            instance,
+            null(),
+        );
         let mut shown = false;
         loop {
             match receiver.try_recv() {
                 Ok(true) => {
-                    started = Instant::now();
                     shown = true;
                     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                     SetWindowPos(
@@ -170,10 +201,25 @@ fn windows_widget(receiver: std::sync::mpsc::Receiver<bool>, flag: Arc<AtomicBoo
                 Err(_) => {}
             }
             if shown {
-                let t = started.elapsed().as_secs();
+                let t = elapsed.load(Ordering::Relaxed) / 1000;
+                let paused = pause.load(Ordering::SeqCst);
                 SetWindowTextW(
                     label,
-                    wide(&format!("● Recording  {:02}:{:02}", t / 60, t % 60)).as_ptr(),
+                    wide(&format!(
+                        "{}  {:02}:{:02}",
+                        if paused {
+                            "Ⅱ Paused"
+                        } else {
+                            "● Recording"
+                        },
+                        t / 60,
+                        t % 60
+                    ))
+                    .as_ptr(),
+                );
+                SetWindowTextW(
+                    pause_button,
+                    wide(if paused { "Resume" } else { "Pause" }).as_ptr(),
                 );
             }
             let mut message: MSG = std::mem::zeroed();

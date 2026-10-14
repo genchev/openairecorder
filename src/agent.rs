@@ -16,7 +16,7 @@ pub struct Agents {
     pub codex: PathBuf,
     pub claude: PathBuf,
 }
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Default)]
 pub struct Availability {
     pub installed: bool,
     pub version: Option<String>,
@@ -289,7 +289,7 @@ fn command(bin: &Path) -> Command {
             for dir in &dirs {
                 let exe = dir.join(format!("{name}.exe"));
                 if exe.is_file() {
-                    return Command::new(exe);
+                    return quiet(&exe);
                 }
             }
             let script = if name == "codex" {
@@ -300,14 +300,27 @@ fn command(bin: &Path) -> Command {
             for dir in dirs {
                 let entry = dir.join(script);
                 if entry.is_file() {
-                    let mut command = Command::new("node");
+                    let mut command = quiet(Path::new("node"));
                     command.arg(entry);
                     return command;
                 }
             }
         }
     }
-    Command::new(bin)
+    quiet(bin)
+}
+fn quiet(bin: &Path) -> Command {
+    let command = Command::new(bin);
+    #[cfg(windows)]
+    {
+        let mut command = command;
+        command.creation_flags(0x08000000);
+        command
+    }
+    #[cfg(not(windows))]
+    {
+        command
+    }
 }
 fn parse(text: &str) -> Result<Output> {
     let text = text.trim();

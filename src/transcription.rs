@@ -2,6 +2,30 @@ use anyhow::{Context, Result, ensure};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
+fn bundled(path: &str) -> PathBuf {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        let candidate = parent.join(path);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from(path)
+}
+fn quiet(path: &Path) -> Command {
+    let command = Command::new(path);
+    #[cfg(windows)]
+    {
+        let mut command = command;
+        command.creation_flags(0x08000000);
+        command
+    }
+    #[cfg(not(windows))]
+    {
+        command
+    }
+}
 #[derive(Clone)]
 pub struct Transcriber {
     pub binary: PathBuf,
@@ -14,7 +38,7 @@ impl Transcriber {
             binary: std::env::var_os("WHISPER_BIN")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| {
-                    let local = PathBuf::from(".local-tools/whisper/Release/whisper-cli.exe");
+                    let local = bundled(".local-tools/whisper/Release/whisper-cli.exe");
                     if cfg!(windows) && local.is_file() {
                         local
                     } else {
@@ -24,7 +48,7 @@ impl Transcriber {
             model: std::env::var_os("WHISPER_MODEL")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| {
-                    let local = PathBuf::from(".local-tools/ggml-tiny.bin");
+                    let local = bundled(".local-tools/ggml-tiny.bin");
                     if local.is_file() {
                         local
                     } else {
@@ -38,7 +62,12 @@ impl Transcriber {
     }
     pub async fn available(&self) -> bool {
         self.model.is_file()
-            && Command::new(&self.binary)
+            && quiet(&self.ffmpeg)
+                .arg("-version")
+                .output()
+                .await
+                .is_ok_and(|o| o.status.success())
+            && quiet(&self.binary)
                 .arg("--help")
                 .output()
                 .await
@@ -50,7 +79,7 @@ impl Transcriber {
             "Local speech model is missing. Follow the setup instructions in README.md."
         );
         let wav = dir.join("speech.wav");
-        let conversion = Command::new(&self.ffmpeg)
+        let conversion = quiet(&self.ffmpeg)
             .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
             .arg(audio)
             .args(["-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le"])
@@ -63,7 +92,7 @@ impl Transcriber {
             "Audio conversion failed. Choose a supported audio file."
         );
         let out = dir.join("transcript");
-        let result = Command::new(&self.binary)
+        let result = quiet(&self.binary)
             .arg("-m")
             .arg(&self.model)
             .arg("-f")

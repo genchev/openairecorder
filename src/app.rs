@@ -83,12 +83,422 @@ pub struct Action {
     pub done: bool,
 }
 #[derive(Serialize, Deserialize, Clone, Debug)]
-struct GlobalAction {
-    id: Uuid,
-    source_session: Uuid,
-    source_title: String,
-    source_action: Uuid,
-    action: Action,
+pub(crate) struct GlobalAction {
+    pub id: Uuid,
+    pub source_session: Uuid,
+    pub source_title: String,
+    pub source_action: Uuid,
+    pub action: Action,
+}
+
+pub(crate) mod desktop_api {
+    use super::*;
+    #[derive(Default)]
+    pub struct Snapshot {
+        pub sessions: Vec<Recording>,
+        pub actions: Vec<GlobalAction>,
+        pub theme: String,
+    }
+    pub enum Command {
+        Import {
+            path: PathBuf,
+            title: String,
+            owned_capture: bool,
+        },
+        Transcribe(Uuid),
+        Generate {
+            id: Uuid,
+            provider: String,
+            consent: bool,
+        },
+        Notes {
+            id: Uuid,
+            notes: String,
+        },
+        Pin {
+            id: Uuid,
+            pinned: bool,
+        },
+        Complete {
+            id: Uuid,
+            action: Uuid,
+            done: bool,
+        },
+        Copy {
+            id: Uuid,
+            action: Uuid,
+        },
+        GlobalComplete {
+            id: Uuid,
+            done: bool,
+        },
+        GlobalRemove(Uuid),
+        Delete(Uuid),
+        Theme(String),
+        Playback(Uuid),
+    }
+    pub struct Outcome {
+        pub session: Option<Uuid>,
+        pub file: Option<PathBuf>,
+        pub message: String,
+    }
+    pub async fn recover(s: &State) -> Result<(usize, usize), String> {
+        let mut entries = tokio::fs::read_dir(&s.root)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut recovered = 0;
+        let mut retained = 0;
+        while let Some(entry) = entries.next_entry().await.map_err(|e| e.to_string())? {
+            let path = entry.path();
+            if !path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(".capture-"))
+                || path.extension().is_none_or(|e| e != "wav")
+            {
+                continue;
+            }
+            if !hound::WavReader::open(&path).is_ok_and(|r| r.duration() > 0) {
+                retained += 1;
+                continue;
+            }
+            match execute(
+                s,
+                Command::Import {
+                    path,
+                    title: "Recovered recording".into(),
+                    owned_capture: true,
+                },
+            )
+            .await
+            {
+                Ok(_) => recovered += 1,
+                Err(_) => retained += 1,
+            }
+        }
+        Ok((recovered, retained))
+    }
+    pub async fn snapshot(s: &State) -> Result<Snapshot, String> {
+        Ok(Snapshot {
+            sessions: s.list().await.map_err(|e| e.to_string())?,
+            actions: s.globals().await.map_err(|e| e.1)?,
+            theme: get_settings(Extract(s.clone()))
+                .await
+                .map_err(|e| e.1)?
+                .0
+                .theme,
+        })
+    }
+    pub async fn output(s: &State, id: Uuid) -> String {
+        match events(Extract(s.clone()), Path(id)).await {
+            Ok(Json(value)) => format!(
+                "{}\n{}",
+                value["output"].as_str().unwrap_or(""),
+                value["diagnostics"].as_str().unwrap_or("")
+            ),
+            Err(_) => String::new(),
+        }
+    }
+    pub async fn execute(s: &State, command: Command) -> Result<Outcome, String> {
+        let state = Extract(s.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "127.0.0.1:8787".parse().unwrap());
+        let mut outcome = Outcome {
+            session: None,
+            file: None,
+            message: "Saved".into(),
+        };
+        match command {
+            Command::Import {
+                path,
+                title,
+                owned_capture,
+            } => {
+                let size = tokio::fs::metadata(&path)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .len();
+                if size == 0 || (!owned_capture && size > 150 * 1024 * 1024) {
+                    return Err("Choose a nonempty file smaller than 150 MB".into());
+                }
+                if owned_capture {
+                    let parent = path
+                        .parent()
+                        .ok_or("Invalid capture path")?
+                        .canonicalize()
+                        .map_err(|e| e.to_string())?;
+                    if parent != s.root.canonicalize().map_err(|e| e.to_string())?
+                        || !path
+                            .file_name()
+                            .is_some_and(|n| n.to_string_lossy().starts_with(".capture-"))
+                    {
+                        return Err("Capture file is outside this app's data directory".into());
+                    }
+                }
+                let id = Uuid::new_v4();
+                let dir = s.root.join(id.to_string());
+                tokio::fs::create_dir(&dir)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if owned_capture {
+                    tokio::fs::rename(&path, dir.join("audio"))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                } else {
+                    tokio::fs::copy(&path, dir.join("audio"))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                let audio_type = match path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "wav" => "audio/wav",
+                    "mp3" => "audio/mpeg",
+                    "mp4" | "m4a" => "audio/mp4",
+                    "ogg" | "opus" => "audio/ogg",
+                    "flac" => "audio/flac",
+                    "webm" => "audio/webm",
+                    _ => "application/octet-stream",
+                };
+                let r = Recording {
+                    id,
+                    title: if title.trim().is_empty() {
+                        "Untitled conversation".into()
+                    } else {
+                        title.chars().take(200).collect()
+                    },
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                    status: "recorded".into(),
+                    transcript: String::new(),
+                    notes: String::new(),
+                    error: None,
+                    pinned: false,
+                    audio_type: audio_type.into(),
+                    actions: vec![],
+                };
+                if let Err(e) = s.save(&r).await {
+                    if owned_capture {
+                        let _ = tokio::fs::rename(dir.join("audio"), &path).await;
+                    }
+                    return Err(e.to_string());
+                }
+                outcome.session = Some(id);
+                outcome.message = "Recording saved on this computer".into();
+            }
+            Command::Transcribe(id) => {
+                process(state, Path(id), headers).await.map_err(|e| e.1)?;
+                outcome.message = "Transcribing locally…".into();
+            }
+            Command::Generate {
+                id,
+                provider,
+                consent,
+            } => {
+                generate_notes(state, Path(id), Json(AgentRequest { provider, consent }))
+                    .await
+                    .map_err(|e| e.1)?;
+                outcome.message = "Agent is generating notes…".into();
+            }
+            Command::Notes { id, notes } => {
+                save_notes(
+                    state,
+                    Path(id),
+                    headers,
+                    Json(Notes {
+                        notes: Some(notes),
+                        pinned: None,
+                    }),
+                )
+                .await
+                .map_err(|e| e.1)?;
+            }
+            Command::Pin { id, pinned } => {
+                save_notes(
+                    state,
+                    Path(id),
+                    headers,
+                    Json(Notes {
+                        notes: None,
+                        pinned: Some(pinned),
+                    }),
+                )
+                .await
+                .map_err(|e| e.1)?;
+            }
+            Command::Complete { id, action, done } => {
+                session_toggle(state, Path((id, action)), Json(Toggle { done }))
+                    .await
+                    .map_err(|e| e.1)?;
+            }
+            Command::Copy { id, action } => {
+                copy_action(
+                    state,
+                    Json(CopyAction {
+                        session: id,
+                        action,
+                    }),
+                )
+                .await
+                .map_err(|e| e.1)?;
+                outcome.message = "Copied to global actions".into();
+            }
+            Command::GlobalComplete { id, done } => {
+                global_toggle(state, Path(id), Json(Toggle { done }))
+                    .await
+                    .map_err(|e| e.1)?;
+            }
+            Command::GlobalRemove(id) => {
+                global_delete(state, Path(id)).await.map_err(|e| e.1)?;
+            }
+            Command::Delete(id) => {
+                delete(state, Path(id), headers).await.map_err(|e| e.1)?;
+                outcome.message = "Session deleted; copied global actions retained".into();
+            }
+            Command::Theme(theme) => {
+                set_settings(state, Json(Settings { theme }))
+                    .await
+                    .map_err(|e| e.1)?;
+            }
+            Command::Playback(id) => {
+                s.load(id).await.map_err(|e| e.1)?;
+                let dir = s.root.join(id.to_string());
+                let wav = dir.join("playback.wav");
+                if !wav.is_file() {
+                    let mut cmd = tokio::process::Command::new(&s.transcriber.ffmpeg);
+                    #[cfg(windows)]
+                    cmd.creation_flags(0x08000000);
+                    let result = cmd
+                        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
+                        .arg(dir.join("audio"))
+                        .args(["-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le"])
+                        .arg(&wav)
+                        .output()
+                        .await
+                        .map_err(|e| format!("Cannot start ffmpeg: {e}"))?;
+                    if !result.status.success() {
+                        let _ = tokio::fs::remove_file(wav).await;
+                        return Err("Cannot decode this audio file for playback".into());
+                    }
+                }
+                outcome.session = Some(id);
+                outcome.file = Some(wav);
+                outcome.message = "Playing audio".into();
+            }
+        }
+        Ok(outcome)
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[tokio::test]
+        async fn native_commands_use_the_same_persistent_store_without_http() {
+            let (s, r) = super::super::tests::fixture().await;
+            execute(
+                &s,
+                Command::Pin {
+                    id: r.id,
+                    pinned: true,
+                },
+            )
+            .await
+            .unwrap();
+            execute(
+                &s,
+                Command::Copy {
+                    id: r.id,
+                    action: r.actions[0].id,
+                },
+            )
+            .await
+            .unwrap();
+            execute(
+                &s,
+                Command::Notes {
+                    id: r.id,
+                    notes: "## Native notes".into(),
+                },
+            )
+            .await
+            .unwrap();
+            execute(&s, Command::Theme("dark".into())).await.unwrap();
+            let data = snapshot(&s).await.unwrap();
+            assert!(data.sessions[0].pinned);
+            assert_eq!(data.actions.len(), 1);
+            assert_eq!(data.theme, "dark");
+            execute(&s, Command::Delete(r.id)).await.unwrap();
+            assert_eq!(snapshot(&s).await.unwrap().actions.len(), 1);
+            tokio::fs::remove_dir_all(s.root).await.unwrap();
+        }
+        #[tokio::test]
+        async fn owned_capture_is_moved_and_external_import_is_preserved() {
+            let (s, _) = super::super::tests::fixture().await;
+            let capture = s.root.join(".capture-test.wav");
+            tokio::fs::write(&capture, b"recording").await.unwrap();
+            let result = execute(
+                &s,
+                Command::Import {
+                    path: capture.clone(),
+                    title: "Native capture".into(),
+                    owned_capture: true,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(!capture.exists());
+            assert!(
+                s.root
+                    .join(result.session.unwrap().to_string())
+                    .join("audio")
+                    .is_file()
+            );
+            let external = s.root.join("meeting.wav");
+            tokio::fs::write(&external, b"recording").await.unwrap();
+            execute(
+                &s,
+                Command::Import {
+                    path: external.clone(),
+                    title: "Imported".into(),
+                    owned_capture: false,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(external.exists());
+            assert!(
+                execute(
+                    &s,
+                    Command::Import {
+                        path: external,
+                        title: String::new(),
+                        owned_capture: true
+                    }
+                )
+                .await
+                .is_err()
+            );
+            tokio::fs::remove_dir_all(s.root).await.unwrap();
+        }
+    }
+}
+fn default_data_root() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(parent) = exe.parent()
+        {
+            let legacy = parent.join("recordings");
+            if legacy.is_dir() {
+                return legacy;
+            }
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(local).join("OpenAIRecorder/recordings");
+        }
+    }
+    PathBuf::from("recordings")
 }
 fn default_audio_type() -> String {
     "application/octet-stream".into()
@@ -104,7 +514,7 @@ impl State {
     pub async fn new() -> anyhow::Result<Self> {
         let root = std::env::var("RECORDER_DATA_DIR")
             .map(PathBuf::from)
-            .unwrap_or(PathBuf::from("recordings"));
+            .unwrap_or_else(|_| default_data_root());
         tokio::fs::create_dir_all(&root).await?;
         let state = Self {
             root,
@@ -253,7 +663,7 @@ async fn capture_stop(Extract(s): Extract<State>) -> StatusCode {
 async fn capture_status(Extract(s): Extract<State>) -> Json<serde_json::Value> {
     use std::sync::atomic::Ordering;
     Json(
-        serde_json::json!({"active":s.overlay.active.load(Ordering::SeqCst),"stop_requested":s.overlay.stop.swap(false,Ordering::SeqCst),"native_widget":cfg!(windows)}),
+        serde_json::json!({"active":s.overlay.active.load(Ordering::SeqCst),"stop_requested":s.overlay.stop.swap(false,Ordering::SeqCst),"native_widget":cfg!(windows),"paused":s.overlay.pause.load(Ordering::SeqCst),"elapsed_ms":s.overlay.elapsed_ms.load(Ordering::Relaxed)}),
     )
 }
 async fn guard(
@@ -794,7 +1204,7 @@ mod tests {
         h.insert("host", "evil.example:8787".parse().unwrap());
         assert!(local(&h).is_err());
     }
-    async fn fixture() -> (State, Recording) {
+    pub(super) async fn fixture() -> (State, Recording) {
         let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
         let id = Uuid::new_v4();
         tokio::fs::create_dir_all(root.join(id.to_string()))
