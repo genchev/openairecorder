@@ -18,3 +18,7 @@ Current Gemini model IDs, audio-input pricing, and the restricted availability o
 27 tests pass, including archive retention just before and exactly at 30 days, repeated archive idempotence, restore canceling expiry, removal of the complete session folder, survival of copied global actions, legacy metadata without an archive field, invalid/future dates, and active-recording protection. A headless layout regression renders 25 rows and asserts fixed horizontal position, row height, and sidebar width.
 
 The compact native library was inspected in a Linux virtual display with isolated Bulgarian/English sample records. Pinning into the separate section, archive confirmation, archiving into the expandable folder, and restoration were exercised using pointer events. This is native Linux UI verification; physical Windows UI behavior remains unverified.
+
+## Application icon and footer branding
+
+The Windows release PE was inspected with llvm-readobj: it contains seven ICON resources and one GROUP_ICON resource. The ICO sizes (16, 24, 32, 48, 64, 128, 256) and the runtime 64×64 RGBA length were verified. Eframe receives the logo through the native viewport icon setting, which supplies its Windows title/taskbar icon setter. The footer link and its placement below Saved on this computer were visually inspected in the Linux native display. 27 tests, Linux/Windows Clippy with warnings denied, and the Windows release build passed. Actual Windows taskbar/Explorer appearance remains unverified on a physical Windows system.

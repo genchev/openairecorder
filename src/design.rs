@@ -125,6 +125,13 @@ pub fn eyebrow(ui: &mut egui::Ui, text: &str) {
 pub fn subtitle(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).size(14.0).color(muted(ui)));
 }
+pub fn app_icon() -> egui::IconData {
+    egui::IconData {
+        rgba: include_bytes!("../assets/icons/openairecorder-64.rgba").to_vec(),
+        width: 64,
+        height: 64,
+    }
+}
 pub fn logo(ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(34.0, 34.0), egui::Sense::hover());

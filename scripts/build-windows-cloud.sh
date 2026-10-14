@@ -15,6 +15,7 @@ rustup target add x86_64-pc-windows-gnullvm
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER="$compiler/bin/x86_64-w64-mingw32-clang"
 export CC_x86_64_pc_windows_gnullvm="$compiler/bin/x86_64-w64-mingw32-clang"
 export AR_x86_64_pc_windows_gnullvm="$compiler/bin/llvm-ar"
+export RC_x86_64_pc_windows_gnullvm="$compiler/bin/x86_64-w64-mingw32-windres"
 cd /workspace/openairecorder
 cargo build --locked --release --target x86_64-pc-windows-gnullvm -j 3
 python scripts/package-windows.py

@@ -82,7 +82,8 @@ pub fn run(state: app::State, runtime: tokio::runtime::Handle) -> anyhow::Result
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 850.0])
             .with_min_inner_size([760.0, 550.0])
-            .with_title("OpenAIRecorder"),
+            .with_title("OpenAIRecorder")
+            .with_icon(design::app_icon()),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
@@ -632,7 +633,7 @@ impl Desktop {
                 egui::ScrollArea::vertical()
                     .id_salt("library-scroll")
                     .auto_shrink([false, false])
-                    .max_height((ui.available_height() - 78.0).max(0.0))
+                    .max_height((ui.available_height() - 100.0).max(0.0))
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 3.0;
                         let width = ui.available_width();
@@ -727,6 +728,7 @@ impl Desktop {
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.add_space(8.0);
                     design::subtitle(ui, "Your recordings. Your space.");
+                    ui.hyperlink_to("www.giga.tips", "https://www.giga.tips");
                     design::pill(ui, "SAVED ON THIS COMPUTER", ACCENT);
                 });
             });
