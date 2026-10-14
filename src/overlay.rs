@@ -146,7 +146,7 @@ fn windows_widget(
     }
     unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         match msg {
-            WM_CTLCOLORSTATIC => unsafe {
+            WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => unsafe {
                 SetTextColor(wp as HDC, 0x00f7f0ee);
                 SetBkColor(wp as HDC, 0x00261b19);
                 BRUSH.load(Ordering::Relaxed) as LRESULT
@@ -191,6 +191,13 @@ fn windows_widget(
             },
             WM_DRAWITEM => unsafe {
                 let item = &*(lp as *const DRAWITEMSTRUCT);
+                // Owner-drawn rounded controls must paint their entire rectangle,
+                // including corners that would otherwise retain the light Windows face.
+                FillRect(
+                    item.hDC,
+                    &item.rcItem,
+                    BRUSH.load(Ordering::SeqCst) as HBRUSH,
+                );
                 let selected = item.itemState & 1 != 0;
                 let brush = CreateSolidBrush(if selected { 0x00644539 } else { 0x003b2b26 });
                 let old = SelectObject(item.hDC, brush as HGDIOBJ);
@@ -232,10 +239,24 @@ fn windows_widget(
                 SelectObject(item.hDC, old);
                 SelectObject(item.hDC, pen);
                 DeleteObject(ink as HGDIOBJ);
-                if item.itemState & 0x10 != 0 {
+                if item.itemState & 0x10 != 0 && item.itemState & 0x200 == 0 {
                     let mut focus = item.rcItem;
                     InflateRect(&mut focus, -px(3), -px(3));
-                    DrawFocusRect(item.hDC, &focus);
+                    let outline = CreatePen(PS_SOLID, px(1).max(1), 0x00ffa8b9);
+                    let old_pen = SelectObject(item.hDC, outline as HGDIOBJ);
+                    let old_brush = SelectObject(item.hDC, GetStockObject(NULL_BRUSH));
+                    RoundRect(
+                        item.hDC,
+                        focus.left,
+                        focus.top,
+                        focus.right,
+                        focus.bottom,
+                        px(6),
+                        px(6),
+                    );
+                    SelectObject(item.hDC, old_brush);
+                    SelectObject(item.hDC, old_pen);
+                    DeleteObject(outline as HGDIOBJ);
                 }
                 1
             },

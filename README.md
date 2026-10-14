@@ -75,3 +75,13 @@ cargo clippy --locked --all-targets -- -D warnings
 The app defaults to its native GUI. Linux `--desktop` previews the same interface with an X display; capture, playback, DPAPI, and the real floating strip are Windows-specific. Explicit `--web` exposes a loopback development API only, not a browser app. Cloud developer setup/build scripts are not distributed as end-user installers.
 
 Tests use a local simulated Gemini API and do not consume provider quota. See [VALIDATION.md](VALIDATION.md). Live Google authentication, model accuracy, quotas, and physical Windows capture/DPAPI/widget behavior need testing on Windows with your own key entered in the app.
+
+### Current affordable Gemini models (checked 2026-10-14)
+
+The initial picker includes `gemini-3.5-flash-lite` (new default), `gemini-3.1-flash-lite`, `gemini-3.8-flash`, `gemini-3.6-flash`, and `gemini-3-flash-preview`. Saved model choices remain unchanged. Refresh available models replaces suggestions with the models exposed to your API key; use Test audio & notes before recording. Live, TTS, image, and dedicated transcription endpoints are not interchangeable with this app's `generateContent` workflow.
+
+Google's standard paid prices per million tokens: 3.5 Flash-Lite is $0.30 audio input / $2.50 output; 3.1 Flash-Lite is $0.50 audio input / $1.50 output. The cheapest total depends on how much transcript, cumulative context, notes, and thinking each minute produces. 3.8 and 3.6 Flash are higher quality options, currently $0.75 input / $3.75 output through December 31, 2026, with announced increases afterward. These are token prices, not a fixed meeting price. Free-tier availability and quotas depend on the account.
+
+Google restricts Gemini 2.5 access to projects with previous usage, which can explain a 404 on a new key/project. Sources: [model catalog](https://ai.google.dev/gemini-api/docs/models) and [pricing](https://ai.google.dev/gemini-api/docs/pricing).
+
+Library rows include a trash control with confirmation. Deleting a different session preserves unsaved notes in the current session; copied global actions remain. Active recording/processing sessions cannot be deleted. The floating recorder paints the full dark button background and uses a purple keyboard-focus outline, avoiding light Windows button corners. The Settings preview uses the same pause/resume/stop shapes.

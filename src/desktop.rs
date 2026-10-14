@@ -107,7 +107,7 @@ impl Desktop {
             sender,
             receiver,
             data: Snapshot::default(),
-            gemini_models: vec![gemini_settings.audio_model.clone()],
+            gemini_models: crate::gemini::suggested_models(&gemini_settings.audio_model),
             gemini_settings,
             gemini_key,
             gemini_checking: false,
@@ -437,6 +437,8 @@ impl Desktop {
                                     }
                                 } else {
                                     self.view = View::New;
+                                    self.notes_dirty = false;
+                                    self.notes_edit.clear();
                                 }
                             }
                             self.data = data;
@@ -603,6 +605,7 @@ impl Desktop {
                 ui.add_space(10.0);
                 let query = self.search.to_lowercase();
                 let mut selected = None;
+                let mut delete_requested = None;
                 let mut matches = 0;
                 egui::ScrollArea::vertical()
                     .id_salt("library-scroll")
@@ -639,22 +642,79 @@ impl Desktop {
                             let label = format!(
                                 "{}{}\n{}",
                                 if r.pinned { "•  " } else { "" },
-                                short(&r.title, 25),
+                                short(&r.title, 20),
                                 date(&r.created_at)
                             );
-                            if ui
-                                .add_sized(
-                                    [ui.available_width(), 58.0],
-                                    egui::Button::new(egui::RichText::new(label).size(13.0))
-                                        .fill(fill)
-                                        .stroke(egui::Stroke::NONE)
-                                        .corner_radius(9),
-                                )
-                                .on_hover_text(&r.title)
-                                .clicked()
-                            {
-                                selected = Some(r.id);
-                            }
+                            ui.horizontal(|ui| {
+                                let width = (ui.available_width() - 36.0).max(80.0);
+                                if ui
+                                    .add_sized(
+                                        [width, 58.0],
+                                        egui::Button::new(egui::RichText::new(label).size(13.0))
+                                            .fill(fill)
+                                            .stroke(egui::Stroke::NONE)
+                                            .corner_radius(9),
+                                    )
+                                    .on_hover_text(&r.title)
+                                    .clicked()
+                                {
+                                    selected = Some(r.id);
+                                }
+                                let enabled = !self.busy
+                                    && r.status != "recording"
+                                    && r.status != "processing"
+                                    && !self.state.gemini.is_running(r.id);
+                                let response = ui
+                                    .add_enabled_ui(enabled, |ui| {
+                                        ui.add_sized(
+                                            [28.0, 28.0],
+                                            egui::Button::new("").corner_radius(7),
+                                        )
+                                    })
+                                    .inner
+                                    .on_hover_text(if enabled {
+                                        "Delete session"
+                                    } else {
+                                        "Wait until recording and processing finish"
+                                    });
+                                response.widget_info(|| {
+                                    egui::WidgetInfo::labeled(
+                                        egui::WidgetType::Button,
+                                        enabled,
+                                        "Delete session",
+                                    )
+                                });
+                                let c = response.rect.center();
+                                let stroke = egui::Stroke::new(
+                                    1.3_f32,
+                                    ui.visuals()
+                                        .widgets
+                                        .inactive
+                                        .fg_stroke
+                                        .color
+                                        .gamma_multiply(if enabled { 1.0 } else { 0.4 }),
+                                );
+                                ui.painter().line_segment(
+                                    [c + egui::vec2(-6.0, -4.0), c + egui::vec2(6.0, -4.0)],
+                                    stroke,
+                                );
+                                ui.painter().line_segment(
+                                    [c + egui::vec2(-2.0, -6.0), c + egui::vec2(2.0, -6.0)],
+                                    stroke,
+                                );
+                                ui.painter().add(egui::Shape::line(
+                                    vec![
+                                        c + egui::vec2(-4.0, -2.0),
+                                        c + egui::vec2(-3.0, 6.0),
+                                        c + egui::vec2(3.0, 6.0),
+                                        c + egui::vec2(4.0, -2.0),
+                                    ],
+                                    stroke,
+                                ));
+                                if response.clicked() {
+                                    delete_requested = Some(r.id);
+                                }
+                            });
                         }
                         if matches == 0 {
                             design::subtitle(
@@ -667,6 +727,9 @@ impl Desktop {
                             );
                         }
                     });
+                if let Some(id) = delete_requested {
+                    self.delete_confirm = Some(id);
+                }
                 if let Some(id) = selected {
                     self.navigate(View::Session(id));
                 }
@@ -1484,6 +1547,7 @@ if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
             ui.add_space(10.0);design::eyebrow(ui,"AUDIO → TEXT MODEL");
             model_picker(ui,"gemini-audio",&mut self.gemini_settings.audio_model,&self.gemini_models);
             design::subtitle(ui,"Choose a model with audio input. Gemini text models can return Markdown; by default one model handles both audio and notes.");
+            design::subtitle(ui,"Affordable starting point: Gemini 3.5 Flash-Lite. Also available: 3.1 Flash-Lite, 3.6 Flash and 3.8 Flash. Refresh checks your key; Test verifies audio and notes. Gemini 2.5 access is restricted for new projects.");
             ui.checkbox(&mut self.gemini_settings.separate_notes,"Use a separate model for notes and actions");
             if self.gemini_settings.separate_notes {
                 design::eyebrow(ui,"NOTES MODEL (REQUIRED)");model_picker(ui,"gemini-notes",&mut self.gemini_settings.notes_model,&self.gemini_models);
@@ -1541,7 +1605,7 @@ if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
         if let Some(id) = self.delete_confirm {
             egui::Window::new("Delete this session?").collapsible(false).resizable(false).show(ctx,|ui|{
             ui.label("Its audio, transcript and notes will be deleted. Copied global actions remain.");
-            if ui.add_enabled(!self.busy,egui::Button::new("Delete session")).clicked(){self.delete_confirm=None;self.notes_dirty=false;self.dispatch(Command::Delete(id),ctx);}
+            if ui.add_enabled(!self.busy,egui::Button::new("Delete session")).clicked(){self.delete_confirm=None;self.dispatch(Command::Delete(id),ctx);}
             if ui.button("Cancel").clicked(){self.delete_confirm=None;}
         });
         }
@@ -1636,23 +1700,42 @@ fn recorder_preview(ui: &mut egui::Ui, paused: &mut bool) {
                 egui::Color32::from_rgb(38, 43, 59)
             },
         );
-        ui.painter().text(
-            bounds.center(),
-            egui::Align2::CENTER_CENTER,
-            if i == 1 {
-                "■"
-            } else if *paused {
-                "▶"
-            } else {
-                "Ⅱ"
-            },
-            egui::FontId::proportional(17.0),
-            if i == 1 {
-                egui::Color32::from_rgb(245, 150, 168)
-            } else {
-                egui::Color32::WHITE
-            },
-        );
+        let ink = if i == 1 {
+            egui::Color32::from_rgb(245, 150, 168)
+        } else {
+            egui::Color32::from_rgb(238, 240, 247)
+        };
+        if i == 1 {
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(
+                    bounds.min + egui::vec2(11.0, 11.0),
+                    egui::vec2(10.0, 10.0),
+                ),
+                1.5,
+                ink,
+            );
+        } else if *paused {
+            ui.painter().add(egui::Shape::convex_polygon(
+                vec![
+                    bounds.min + egui::vec2(12.0, 10.0),
+                    bounds.min + egui::vec2(23.0, 16.0),
+                    bounds.min + egui::vec2(12.0, 22.0),
+                ],
+                ink,
+                egui::Stroke::NONE,
+            ));
+        } else {
+            for x in [11.0, 19.0] {
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_size(
+                        bounds.min + egui::vec2(x, 10.0),
+                        egui::vec2(3.0, 12.0),
+                    ),
+                    1,
+                    ink,
+                );
+            }
+        }
         if response.clicked() && i == 0 {
             *paused = !*paused;
         }
@@ -1761,6 +1844,53 @@ mod tests {
         assert!(ctx.style().visuals.dark_mode);
         Desktop::theme(&ctx, "light");
         assert!(!ctx.style().visuals.dark_mode);
+        // Deleting another library session must not erase edits in the open one.
+        let id = Uuid::new_v4();
+        app.view = View::Session(id);
+        app.notes_dirty = true;
+        app.notes_edit = "unsaved Bulgarian notes: бележки".into();
+        let recording = app::Recording {
+            id,
+            title: "Current session".into(),
+            created_at: String::new(),
+            status: "ready".into(),
+            transcript: String::new(),
+            gemini_processed: 0,
+            notes: "saved version".into(),
+            error: None,
+            pinned: false,
+            audio_type: "audio/wav".into(),
+            actions: vec![],
+        };
+        app.sender
+            .send(Message::Snapshot(
+                app.epoch,
+                Ok(Snapshot {
+                    sessions: vec![recording],
+                    actions: vec![],
+                    theme: app.theme.clone(),
+                }),
+                None,
+            ))
+            .unwrap();
+        app.poll(&ctx);
+        assert!(app.notes_dirty);
+        assert_eq!(app.notes_edit, "unsaved Bulgarian notes: бележки");
+        // Only successful disappearance of the open session discards its editor.
+        app.sender
+            .send(Message::Snapshot(
+                app.epoch,
+                Ok(Snapshot {
+                    theme: app.theme.clone(),
+                    ..Default::default()
+                }),
+                None,
+            ))
+            .unwrap();
+        app.poll(&ctx);
+        assert!(app.view == View::New);
+        assert!(!app.notes_dirty);
+        assert!(app.notes_edit.is_empty());
         drop(app);
         runtime.shutdown_timeout(Duration::from_secs(1));
         std::fs::remove_dir_all(root).unwrap();

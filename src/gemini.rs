@@ -7,6 +7,24 @@ use std::{collections::HashSet, path::Path, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+// Official model/pricing catalog checked 2026-10-14. Account discovery remains authoritative.
+pub fn suggested_models(selected: &str) -> Vec<String> {
+    let mut models: Vec<String> = [
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-3.8-flash",
+        "gemini-3.6-flash",
+        "gemini-3-flash-preview",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    if !selected.is_empty() && !models.iter().any(|m| m == selected) {
+        models.push(selected.to_owned());
+    }
+    models
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -17,7 +35,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            audio_model: "gemini-2.5-flash".into(),
+            audio_model: "gemini-3.5-flash-lite".into(),
             separate_notes: false,
             notes_model: String::new(),
         }
@@ -168,7 +186,8 @@ impl Client {
                 429 => "Gemini rate limit or quota reached (429). Pending audio is kept for retry.",
                 400 =>
                     "Gemini rejected this model/request (400). Check audio support and the selected notes model.",
-                404 => "Gemini model is unavailable (404). Refresh models in Settings.",
+                404 =>
+                    "Gemini model is unavailable to this key (404). Refresh models in Settings and select a current Flash-Lite or Flash model; Gemini 2.5 access is restricted for new projects.",
                 500..=599 =>
                     "Gemini is temporarily unavailable (5xx). Pending audio is kept for retry.",
                 _ => "Gemini request failed. Pending audio is kept for retry.",

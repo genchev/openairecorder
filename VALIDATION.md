@@ -6,3 +6,9 @@
 - Linux and Windows Clippy with warnings denied passed, and the Windows x64 GUI-subsystem release cross-build passed. The cross-build includes HTTPS/rustls, DPAPI bindings, native WASAPI capture/playback, local WebRTC VAD, and DPI-aware compact controls. Archive contents/checksum and runtime dependencies were checked. Whisper, speech models, CLI agents, and end-user setup scripts are not included.
 - No usable Gemini API key was supplied to this cloud. Actual Google authentication, selected-model audio/structured-output support, quotas, latency, and Bulgarian recognition quality are unverified. The app's Test audio & notes control performs that provider check on the user's computer.
 - Physical Windows audio, DPAPI protection/unlocking, topmost dragging, DPI changes, control interaction, and the voice indicator have not run on Windows. Linux rendering, mock API tests, and cross-compilation do not prove that behavior.
+
+## Library and recorder follow-up
+
+The headless UI test now verifies that an updated library snapshot preserves unsaved notes in an open session, and clears its editor only after that session is successfully removed. Existing backend tests cover deletion and survival of copied global actions. Rounded Win32 owner-drawn buttons now clear their full rectangles, and keyboard focus uses a custom purple outline. Settings preview icons use matching vector geometry. This painting fix is cross-compiled, not physically verified on Windows.
+
+Current Gemini model IDs, audio-input pricing, and the restricted availability of 2.5 were checked against Google's model catalog and pricing documentation on 2026-10-14. Suggested models are not proof of account access or recognition quality; account discovery and the audio/notes probe remain necessary. No live Gemini calls were made.
