@@ -1,0 +1,11 @@
+# Validation of the initial version
+
+- Rust build and Clippy with warnings treated as errors: passed.
+- Nine Rust tests: passed. Coverage includes upload/delete persistence, cross-origin protection, agent JSON parsing, Codex/Claude subprocess contracts, subscription-authentication checks, pin ordering, Markdown checkbox export, global-action independence and deletion survival, recording controls, and theme persistence.
+- Chromium workflow: passed using real HTTP handlers and ffmpeg, deterministic recognizer/agent fixtures, and a simulated microphone. Checked import/playback, recording/stop/save, notes preview, search, pins, session/global checkboxes, deletion survival, narrow layouts, and Light/Dark/System settings. No browser JavaScript errors occurred. The mocked agent/recognizer checks do not demonstrate speech quality or provider availability.
+- Real speech recognition: passed. Uploaded whisper.cpp's public JFK sample through the app; ffmpeg conversion and the checksum-verified multilingual tiny model produced the expected “ask not what your country” transcript and a persisted Markdown file.
+- Windows x64 release cross-build: passed using Rust's GNU LLVM target and checksum-verified LLVM-MinGW. The ZIP includes the app, its libunwind runtime, Whisper runtime libraries, the speech model, third-party license notices, and setup instructions. Archive integrity was checked.
+- Live Codex access in this cloud: failed. Its existing sign-in reported HTTP 401 / unusable access token. A sandboxed attempt also encountered a read-only client-state directory. No account credentials were copied, replaced, or requested. Both CLI adapters were validated with mock processes. Live notes require a usable subscription login on the user's computer.
+- Native Windows audio capture, topmost-widget appearance/dragging, and the Windows executable itself have not been run on a Windows machine. They require local Windows testing.
+
+The reusable cloud installation script completed successfully after Internet access was applied. Installation and service-start instructions were saved in the cloud configuration draft. Draft saving is separate from user review/publication and validation in a new task.

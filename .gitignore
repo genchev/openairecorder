@@ -1,0 +1,6 @@
+/target/
+/recordings/
+.env
+*.log
+/.local-tools/
+/dist/
