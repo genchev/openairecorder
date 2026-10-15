@@ -54,6 +54,7 @@ impl TaskEditor {
     }
 }
 enum Message {
+    WorkspaceMoved(Result<crate::workspace::Moved, String>),
     Snapshot(u64, Result<Snapshot, String>, Option<(Uuid, String)>),
     GeminiCheck(Result<(Vec<String>, bool), String>, bool),
     Finished(Result<Outcome, String>),
@@ -94,6 +95,10 @@ pub struct Desktop {
     task_sort: crate::tasks::Sort,
     task_editor: Option<TaskEditor>,
     busy: bool,
+    moving_workspace: bool,
+    move_confirm: Option<std::path::PathBuf>,
+    #[cfg(not(windows))]
+    move_target: String,
     epoch: u64,
     queued: VecDeque<Command>,
     notes_save_pending: bool,
@@ -175,6 +180,10 @@ impl Desktop {
             task_sort: crate::tasks::Sort::default(),
             task_editor: None,
             busy: false,
+            moving_workspace: false,
+            move_confirm: None,
+            #[cfg(not(windows))]
+            move_target: String::new(),
             epoch: 0,
             queued: VecDeque::new(),
             notes_save_pending: false,
@@ -236,7 +245,7 @@ impl Desktop {
         });
     }
     fn refresh(&mut self, ctx: &egui::Context) {
-        if self.refreshing {
+        if self.refreshing || self.moving_workspace {
             return;
         }
         self.refreshing = true;
@@ -258,6 +267,9 @@ impl Desktop {
         });
     }
     fn dispatch(&mut self, command: Command, ctx: &egui::Context) {
+        if self.moving_workspace {
+            return;
+        }
         if self.busy {
             self.queued.push_back(command);
             return;
@@ -270,6 +282,48 @@ impl Desktop {
         self.runtime.spawn(async move {
             let result = desktop_api::execute(&state, command).await;
             let _ = sender.send(Message::Finished(result));
+            ctx.request_repaint();
+        });
+    }
+    fn can_move_workspace(&self) -> bool {
+        !self.busy
+            && !self.recording()
+            && !self.gemini_checking
+            && !self.notes_dirty
+            && self.task_editor.is_none()
+            && self.queued.is_empty()
+            && self.state.gemini.is_idle()
+    }
+    fn move_workspace(&mut self, target: std::path::PathBuf, ctx: &egui::Context) {
+        if !self.can_move_workspace() {
+            self.notice =
+                "Finish recording/processing and save or cancel edits before moving the workspace."
+                    .into();
+            return;
+        }
+        self.stop_playback();
+        self.busy = true;
+        self.moving_workspace = true;
+        self.epoch += 1;
+        self.refreshing = false;
+        let state = self.state.clone();
+        let sender = self.sender.clone();
+        let ctx = ctx.clone();
+        self.runtime.spawn(async move {
+            let _guard = state.jobs.lock().await;
+            let result = if !state.gemini.is_idle() {
+                Err("Wait for Gemini processing to finish before moving".into())
+            } else {
+                let source = state.root.clone();
+                let locator = crate::workspace::location_file();
+                tokio::task::spawn_blocking(move || {
+                    crate::workspace::relocate(&source, &target, &locator)
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r.map_err(|e| format!("{e:#}")))
+            };
+            let _ = sender.send(Message::WorkspaceMoved(result));
             ctx.request_repaint();
         });
     }
@@ -444,6 +498,22 @@ impl Desktop {
     fn poll(&mut self, ctx: &egui::Context) {
         while let Ok(message) = self.receiver.try_recv() {
             match message {
+                Message::WorkspaceMoved(result) => {
+                    self.moving_workspace = false;
+                    self.busy = false;
+                    match result {
+                        Ok(moved) => {
+                            self.state.root = moved.root;
+                            self.markdown_cache = Default::default();
+                            self.notice = moved.warning.unwrap_or_else(|| {
+                                "Workspace moved. This location will be used from now on.".into()
+                            });
+                        }
+                        Err(error) => self.notice = error,
+                    }
+                    self.refresh(ctx);
+                }
+
                 Message::GeminiCheck(result, test_audio) => {
                     self.gemini_checking = false;
                     match result {
@@ -601,6 +671,18 @@ impl Desktop {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.close_confirm = true;
         }
+        if self.moving_workspace {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add_space(40.0);
+                ui.heading("Moving your workspace…");
+                ui.spinner();
+                ui.label(
+                    "Copying and verifying your data. Keep the app open until the move finishes.",
+                );
+            });
+            ctx.request_repaint_after(Duration::from_millis(100));
+            return;
+        }
         let bg = if ctx.style().visuals.dark_mode {
             egui::Color32::from_rgb(25, 27, 38)
         } else {
@@ -677,7 +759,7 @@ impl Desktop {
                 egui::ScrollArea::vertical()
                     .id_salt("library-scroll")
                     .auto_shrink([false, false])
-                    .max_height((ui.available_height() - 100.0).max(0.0))
+                    .max_height((ui.available_height() - 78.0).max(0.0))
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 3.0;
                         let width = ui.available_width();
@@ -772,7 +854,6 @@ impl Desktop {
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.add_space(8.0);
                     design::subtitle(ui, "Your recordings. Your space.");
-                    ui.hyperlink_to("www.giga.tips", "https://www.giga.tips");
                     design::pill(ui, "SAVED ON THIS COMPUTER", ACCENT);
                 });
             });
@@ -1786,12 +1867,37 @@ if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
                 "Recordings, Markdown, and action lists stay in your local workspace.",
             );
             ui.label(self.state.root.display().to_string());
+            ui.add_space(8.0);
+            design::subtitle(ui,"Move your recordings, notes, tasks and settings to an empty folder. The app remembers the new workspace location for future launches.");
+            let enabled=self.can_move_workspace();
+            #[cfg(not(windows))]
+            ui.add(egui::TextEdit::singleline(&mut self.move_target).hint_text("Destination folder (development preview)"));
+            if ui.add_enabled(enabled,egui::Button::new("Move data folder…")).on_disabled_hover_text("Finish recording and processing, and save or cancel edits first.").clicked() {
+                #[cfg(windows)]
+                if let Some(path)=rfd::FileDialog::new().set_title("Choose an empty workspace folder").set_directory(&self.state.root).pick_folder() {
+                    self.move_confirm=Some(path);
+                }
+                #[cfg(not(windows))]
+                { self.move_confirm=Some(std::path::PathBuf::from(self.move_target.trim())); }
+            }
             if ui.button("Open data folder").clicked() {
                 self.open_folder(self.state.root.clone());
             }
         });
     }
     fn dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(target) = self.move_confirm.clone() {
+            egui::Window::new("Move workspace?").collapsible(false).resizable(false).show(ctx,|ui| {
+                ui.label(format!("From: {}",self.state.root.display()));
+                ui.label(format!("To: {}",target.display()));
+                ui.label("All workspace data, including your encrypted Gemini key, will move. The destination must be empty. Keep the app open until copying and verification finish.");
+                if ui.add_enabled(self.can_move_workspace(),design::primary("Move workspace")).clicked() {
+                    self.move_confirm=None;self.move_workspace(target.clone(),ctx);
+                }
+                if ui.button("Cancel").clicked() { self.move_confirm=None; }
+            });
+        }
+
         if let Some(mut editor) = self.task_editor.take() {
             let mut open = true;
             let mut cancel = false;

@@ -389,6 +389,9 @@ impl Service {
             service.active.lock().await.remove(&id);
         });
     }
+    pub fn is_idle(&self) -> bool {
+        self.active.try_lock().is_ok_and(|active| active.is_empty())
+    }
     pub fn is_running(&self, id: Uuid) -> bool {
         self.active
             .try_lock()

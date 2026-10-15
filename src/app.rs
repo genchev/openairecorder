@@ -794,7 +794,7 @@ pub(crate) mod desktop_api {
         }
     }
 }
-fn default_data_root() -> PathBuf {
+pub(crate) fn default_data_root() -> PathBuf {
     #[cfg(windows)]
     {
         if let Ok(exe) = std::env::current_exe()
@@ -823,10 +823,12 @@ fn internal(e: impl std::fmt::Display) -> Error {
 }
 impl State {
     pub async fn new() -> anyhow::Result<Self> {
-        let root = std::env::var("RECORDER_DATA_DIR")
+        let initial = std::env::var("RECORDER_DATA_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| default_data_root());
+        let root = crate::workspace::resolve(&initial, &crate::workspace::location_file())?;
         tokio::fs::create_dir_all(&root).await?;
+        let root = tokio::fs::canonicalize(root).await?;
         let state = Self {
             root,
             overlay: Overlay::new(),

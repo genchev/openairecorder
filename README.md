@@ -72,7 +72,15 @@ Existing/imported **mono 16 kHz PCM16 WAV** can be processed in one-minute batch
 
 Audio, text, and meeting context are sent to Google when you record/process with Gemini. The app does not copy account credentials or use browser sessions. Recordings and notes themselves are **not encrypted**; use a protected local drive.
 
-Data normally lives in `%LOCALAPPDATA%\OpenAIRecorder\recordings`. An existing portable `recordings` folder next to the executable is reused. `RECORDER_DATA_DIR` overrides it. A session contains original `audio`, pending minute WAVs under `chunks`, `record.json`, `transcript.md`, `notes.md`, `live.json` (models/progress without a key), and cached Gemini results. `gemini-settings.json` stores model choices without credentials. Themes and global actions remain in the data root. Deleting a session removes its files; copied global actions remain.
+Data normally lives in `%LOCALAPPDATA%\OpenAIRecorder\recordings`. An existing portable `recordings` folder next to the executable is reused. `RECORDER_DATA_DIR` selects an isolated initial workspace and location-file anchor for development; a saved move is followed on future launches. A session contains original `audio`, pending minute WAVs under `chunks`, `record.json`, `transcript.md`, `notes.md`, `live.json` (models/progress without a key), and cached Gemini results. `gemini-settings.json` stores model choices without credentials. Themes and global actions remain in the data root. Deleting a session removes its files; copied global actions remain.
+
+## Move the workspace
+
+In **Settings → Your data → Move data folder…**, choose or create an **empty folder**, then confirm the move. Recording and Gemini processing must finish first; save or cancel open edits. The app stops playback and pauses workspace commands while it copies and verifies every file. It then switches to the new folder immediately and removes the old files. Recordings, transcripts, Markdown, tasks, settings, pending audio, and the saved Gemini key move together; the key stays encrypted for the same Windows user.
+
+The small location setting stays at `%LOCALAPPDATA%\OpenAIRecorder\workspace-location.json`, outside the default recording folder. Future launches follow this setting. Existing portable workspaces are supported too. With `RECORDER_DATA_DIR`, the locator stays in that original directory, which remains with only the location file after a successful move. Subsequent moves update the same locator, including when moving back to the original folder.
+
+The original remains authoritative until copying, byte verification, and saving the location setting succeed. If an old file changes externally or cannot be removed afterward, the new workspace remains active and the app reports that old files were retained. A missing disk or invalid saved location produces an error rather than silently opening an empty workspace. Keep the app open while moving. The [workspace settings preview](docs/screenshots/workspace-settings.png) uses the native Linux development UI; the Windows version opens a standard folder picker.
 
 ## Development and validation
 
@@ -104,4 +112,6 @@ Archiving clears the pin and records the archive time separately from the record
 
 Cleanup runs before startup recovery and during library refresh while the app is running. If the app is closed on the expiry date, files remain until the next launch; there is no background Windows service. Archives is a library grouping backed by each session's persistent metadata, rather than moving files that live processing might reference. The screenshot [compact library](docs/screenshots/library-archives.png) uses isolated demo data in the Linux native desktop build.
 
-The application uses its purple/mint logo as the native window/taskbar icon. The Windows executable also embeds a seven-size icon resource (16–256 px) for Explorer and shortcuts. The sidebar footer links to **www.giga.tips** directly below Saved on this computer. Icon source assets live under `assets/icons`; the packaged application does not need external icon files.
+The application uses its purple/mint logo as the native window/taskbar icon. The Windows executable also embeds a seven-size icon resource (16–256 px) for Explorer and shortcuts. Icon source assets live under `assets/icons`; the packaged application does not need external icon files.
+
+Development credit: [www.giga.tips](https://www.giga.tips).

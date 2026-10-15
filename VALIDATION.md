@@ -1,6 +1,6 @@
 # Validation — Gemini desktop 0.4
 
-- 33 Rust tests passed. New coverage includes exact 60-second segmentation and final tails, automatic recovery of an interrupted full minute and partial tail, one-/two-model Gemini request contracts, Bulgarian transcript/notes persistence, required separate-notes selection after a capability failure, auth-error retention and explicit retry, idempotent persisted checkpoints, preserved user checkboxes/action identity, and key-file separation/removal. Test requests use an isolated local HTTP fixture with a fake key, not Google's service.
+- 39 Rust tests passed. New coverage includes exact 60-second segmentation and final tails, automatic recovery of an interrupted full minute and partial tail, one-/two-model Gemini request contracts, Bulgarian transcript/notes persistence, required separate-notes selection after a capability failure, auth-error retention and explicit retry, idempotent persisted checkpoints, preserved user checkboxes/action identity, and key-file separation/removal. Test requests use an isolated local HTTP fixture with a fake key, not Google's service.
 - WebRTC speech-indicator buffering and silence were tested. These checks do not establish VAD accuracy for real microphones/noise.
 - Headless native panels/theme checks passed. The Gemini settings and compact-controls design preview were visually inspected in a Linux virtual display, together with sample Bulgarian notes/actions. The preview is not the actual Win32 popup.
 - Linux and Windows Clippy with warnings denied passed, and the Windows x64 GUI-subsystem release cross-build passed. The cross-build includes HTTPS/rustls, DPAPI bindings, native WASAPI capture/playback, local WebRTC VAD, and DPI-aware compact controls. Archive contents/checksum and runtime dependencies were checked. Whisper, speech models, CLI agents, and end-user setup scripts are not included.
@@ -19,7 +19,7 @@ Current Gemini model IDs, audio-input pricing, and the restricted availability o
 
 The compact native library was inspected in a Linux virtual display with isolated Bulgarian/English sample records. Pinning into the separate section, archive confirmation, archiving into the expandable folder, and restoration were exercised using pointer events. This is native Linux UI verification; physical Windows UI behavior remains unverified.
 
-## Application icon and footer branding
+## Application icon (earlier footer branding removed)
 
 The Windows release PE was inspected with llvm-readobj: it contains seven ICON resources and one GROUP_ICON resource. The ICO sizes (16, 24, 32, 48, 64, 128, 256) and the runtime 64×64 RGBA length were verified. Eframe receives the logo through the native viewport icon setting, which supplies its Windows title/taskbar icon setter. The footer link and its placement below Saved on this computer were visually inspected in the Linux native display. 27 tests, Linux/Windows Clippy with warnings denied, and the Windows release build passed. Actual Windows taskbar/Explorer appearance remains unverified on a physical Windows system.
 
@@ -28,3 +28,11 @@ The Windows release PE was inspected with llvm-readobj: it contains seven ICON r
 33 tests pass. New coverage checks personal task creation, exact date and title validation, persisted edits, clearing due dates, concurrent pin/completion/content updates without lost fields, stable added date and action/source identities, legacy metadata, independently edited meeting copies and copy deduplication, freeform-deadline preservation, Unicode search, all four sort modes, undated-task ordering, priority/completion behavior, year-boundary date rollover, and leap-day validity. A headless calendar regression verifies that October 1, 2026 and February 1, 2028 align with Thursday and Tuesday.
 
 The native Linux GUI was exercised with isolated sample tasks: creating a personal task, searching for it, pinning it, editing its due date using the calendar, saving, and reading the persisted JSON. Dark and Light layouts, urgent labels/borders, and the calendar were visually inspected. Native restart loaded saved tasks and pins. Windows Clippy with warnings denied and the Windows release cross-build passed. Physical Windows interaction remains unverified.
+
+## Workspace relocation and README-only credit
+
+39 tests pass, including byte-preserving relocation of audio, pending segments, Unicode notes and a saved fixture key; private key-file permissions on Unix; multiple moves and returning to the original folder; a fixed locator outside the workspace; destination collision/nesting rejection; rollback after a forced locator-commit failure; missing/invalid saved locations; and rejection of linked entries. Tests use isolated temporary folders, with no real Gemini credentials.
+
+The Linux native GUI moved an isolated workspace containing four sessions and eight tasks, left only the locator at the original development anchor, then saved a new task in the new location. Restarting with that original anchor loaded the relocated records and tasks. Settings displays the new root. The Windows folder-picker branch and release are cross-compiled; physical Windows folder selection, cross-volume behavior, and DPAPI loading after relocation remain unverified.
+
+The website link was removed from the application footer. Development credit appears at the end of README.md. Relevant screenshots were refreshed to show the current footer.

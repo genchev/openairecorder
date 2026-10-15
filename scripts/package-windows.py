@@ -15,7 +15,7 @@ with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED, strict_times
     archive.write(compiler / 'x86_64-w64-mingw32/bin/libunwind.dll', f'{prefix}/libunwind.dll')
     archive.write(tools / 'llvm-LICENSE.txt', f'{prefix}/licenses/LLVM.txt')
     archive.write(compiler / 'x86_64-w64-mingw32/share/mingw32/COPYING', f'{prefix}/licenses/mingw-w64.txt')
-    for name in ['README.md', 'VALIDATION.md', 'docs/screenshots/conversation-dark.png', 'docs/screenshots/conversation-light.png', 'docs/screenshots/gemini-settings.png', 'docs/screenshots/recording-controls-preview.png', 'docs/screenshots/library-archives.png', 'docs/screenshots/global-actions-dark.png', 'docs/screenshots/global-actions-light.png', 'docs/screenshots/global-task-editor.png']:
+    for name in ['README.md', 'VALIDATION.md', 'docs/screenshots/conversation-dark.png', 'docs/screenshots/conversation-light.png', 'docs/screenshots/gemini-settings.png', 'docs/screenshots/recording-controls-preview.png', 'docs/screenshots/library-archives.png', 'docs/screenshots/global-actions-dark.png', 'docs/screenshots/global-actions-light.png', 'docs/screenshots/global-task-editor.png', 'docs/screenshots/workspace-settings.png']:
         archive.write(repo / name, f'{prefix}/{name}')
     archive.write(repo / 'assets/fonts/OFL.txt', f'{prefix}/licenses/Inter-OFL.txt')
     registry = tools / 'cargo/registry/src'
@@ -50,6 +50,12 @@ speech-activity bars. Local WebRTC VAD drives the bars without waiting for AI.
 Pause omits new audio and timer time; queued parts may finish. Stop also sends
 the final partial minute. Pending audio and successful responses are kept for
 retry/recovery. Use Retry pending audio after key/model/quota/network errors.
+
+Settings > Your data > Move data folder opens a folder picker. Select an
+empty folder and confirm. Finish recording/processing and save edits first.
+All workspace files are copied and verified before the location switches;
+the old files are then removed. A small workspace-location.json stays in
+the original app configuration area so future launches use the new folder.
 
 Your key is encrypted for your Windows account and stored separately from
 recordings and Markdown. Audio/notes themselves are not encrypted. Recordings
