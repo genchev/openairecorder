@@ -118,6 +118,10 @@ pub(crate) struct GlobalAction {
     pub source_title: String,
     pub source_action: Uuid,
     pub action: Action,
+    #[serde(default)]
+    pub added_at: Option<String>,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 pub(crate) mod desktop_api {
@@ -170,6 +174,16 @@ pub(crate) mod desktop_api {
         GlobalComplete {
             id: Uuid,
             done: bool,
+        },
+        GlobalSave {
+            id: Option<Uuid>,
+            title: String,
+            owner: String,
+            due: Option<String>,
+        },
+        GlobalPin {
+            id: Uuid,
+            pinned: bool,
         },
         GlobalRemove(Uuid),
         Archive {
@@ -469,6 +483,72 @@ pub(crate) mod desktop_api {
                 global_toggle(state, Path(id), Json(Toggle { done }))
                     .await
                     .map_err(|e| e.1)?;
+            }
+            Command::GlobalSave {
+                id,
+                title,
+                owner,
+                due,
+            } => {
+                let title = title.trim();
+                let owner = owner.trim();
+                let due = due.map(|d| d.trim().to_owned());
+                if title.is_empty() || title.chars().count() > 2000 {
+                    return Err("Enter a task title of 1–2,000 characters".into());
+                }
+                if owner.chars().count() > 200 {
+                    return Err("Owner must be 200 characters or fewer".into());
+                }
+                if due
+                    .as_ref()
+                    .is_some_and(|d| !d.is_empty() && crate::tasks::parse_due(d).is_none())
+                {
+                    return Err("Choose a valid date in YYYY-MM-DD format".into());
+                }
+                let _lock = s.jobs.lock().await;
+                let mut actions = s.globals().await.map_err(|e| e.1)?;
+
+                let owner = (!owner.is_empty()).then(|| owner.to_owned());
+                if let Some(id) = id {
+                    let g = actions
+                        .iter_mut()
+                        .find(|g| g.id == id)
+                        .ok_or("Task no longer exists")?;
+                    // Editing content must preserve completion, pin and source identity.
+                    g.action.title = title.into();
+                    g.action.owner = owner;
+                    if let Some(due) = due {
+                        g.action.due = (!due.is_empty()).then_some(due);
+                    }
+                } else {
+                    actions.push(GlobalAction {
+                        id: Uuid::new_v4(),
+                        source_session: Uuid::nil(),
+                        source_action: Uuid::nil(),
+                        source_title: "Personal task".into(),
+                        action: Action {
+                            id: Uuid::new_v4(),
+                            title: title.into(),
+                            owner,
+                            due: due.filter(|d| !d.is_empty()),
+                            done: false,
+                        },
+                        added_at: Some(chrono::Utc::now().to_rfc3339()),
+                        pinned: false,
+                    });
+                }
+                s.save_globals(&actions).await.map_err(|e| e.1)?;
+                outcome.message = "Global task saved".into();
+            }
+            Command::GlobalPin { id, pinned } => {
+                let _lock = s.jobs.lock().await;
+                let mut actions = s.globals().await.map_err(|e| e.1)?;
+                actions
+                    .iter_mut()
+                    .find(|g| g.id == id)
+                    .ok_or("Task no longer exists")?
+                    .pinned = pinned;
+                s.save_globals(&actions).await.map_err(|e| e.1)?;
             }
             Command::GlobalRemove(id) => {
                 global_delete(state, Path(id)).await.map_err(|e| e.1)?;
@@ -1234,6 +1314,8 @@ async fn copy_action(
             source_session: input.session,
             source_title: r.title,
             source_action: input.action,
+            added_at: Some(chrono::Utc::now().to_rfc3339()),
+            pinned: false,
             action,
         });
         s.save_globals(&globals).await?;
@@ -1388,6 +1470,159 @@ mod tests {
         };
         s.save(&r).await.unwrap();
         (s, r)
+    }
+    #[tokio::test]
+    async fn personal_tasks_validate_persist_and_edit_without_losing_completion_or_pin() {
+        use desktop_api::{Command, execute};
+        let (s, _) = fixture().await;
+        execute(
+            &s,
+            Command::GlobalSave {
+                id: None,
+                title: "  Моя задача  ".into(),
+                owner: " Мария ".into(),
+                due: Some("2026-10-20".into()),
+            },
+        )
+        .await
+        .unwrap();
+        let g = s.globals().await.unwrap().remove(0);
+        assert!(g.source_session.is_nil());
+        assert_eq!(g.action.title, "Моя задача");
+        assert_eq!(g.action.owner.as_deref(), Some("Мария"));
+        assert!(chrono::DateTime::parse_from_rfc3339(g.added_at.as_ref().unwrap()).is_ok());
+        let (pin, complete, edit) = tokio::join!(
+            execute(
+                &s,
+                Command::GlobalPin {
+                    id: g.id,
+                    pinned: true
+                }
+            ),
+            execute(
+                &s,
+                Command::GlobalComplete {
+                    id: g.id,
+                    done: true
+                }
+            ),
+            execute(
+                &s,
+                Command::GlobalSave {
+                    id: Some(g.id),
+                    title: "Edited".into(),
+                    owner: String::new(),
+                    due: Some("2026-11-01".into())
+                }
+            )
+        );
+        pin.unwrap();
+        complete.unwrap();
+        edit.unwrap();
+        let edited = s.globals().await.unwrap().remove(0);
+        assert!(edited.pinned && edited.action.done);
+        assert_eq!(edited.action.title, "Edited");
+        assert_eq!(edited.action.due.as_deref(), Some("2026-11-01"));
+        assert!(edited.action.owner.is_none());
+        assert_eq!(edited.added_at, g.added_at);
+        assert_eq!(edited.action.id, g.action.id);
+        for (title, due) in [("", ""), ("Valid", "2026-02-29"), ("Valid", "Friday")] {
+            assert!(
+                execute(
+                    &s,
+                    Command::GlobalSave {
+                        id: Some(g.id),
+                        title: title.into(),
+                        owner: String::new(),
+                        due: Some(due.into())
+                    }
+                )
+                .await
+                .is_err()
+            );
+        }
+        assert_eq!(s.globals().await.unwrap()[0].action.title, "Edited");
+        execute(
+            &s,
+            Command::GlobalSave {
+                id: Some(g.id),
+                title: "No deadline".into(),
+                owner: String::new(),
+                due: Some(String::new()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(s.globals().await.unwrap()[0].action.due.is_none());
+        // Exercise a fresh store read, rather than relying on GUI state.
+        let disk: Vec<GlobalAction> = serde_json::from_slice(
+            &tokio::fs::read(s.root.join("global-actions.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(disk[0].pinned && disk[0].action.done);
+        tokio::fs::remove_dir_all(s.root).await.unwrap();
+    }
+    #[tokio::test]
+    async fn editing_legacy_global_copies_preserves_source_freeform_due_and_copy_identity() {
+        use desktop_api::{Command, execute};
+        let (s, r) = fixture().await;
+        copy_action(
+            Extract(s.clone()),
+            Json(CopyAction {
+                session: r.id,
+                action: r.actions[0].id,
+            }),
+        )
+        .await
+        .unwrap();
+        let g = s.globals().await.unwrap().remove(0);
+        let mut old = serde_json::to_value(vec![g.clone()]).unwrap();
+        old[0].as_object_mut().unwrap().remove("added_at");
+        old[0].as_object_mut().unwrap().remove("pinned");
+        tokio::fs::write(
+            s.root.join("global-actions.json"),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .await
+        .unwrap();
+        execute(
+            &s,
+            Command::GlobalSave {
+                id: Some(g.id),
+                title: "Independently edited".into(),
+                owner: String::new(),
+                due: None,
+            },
+        )
+        .await
+        .unwrap();
+        let edited = s.globals().await.unwrap().remove(0);
+        assert_eq!(edited.action.due.as_deref(), Some("Friday"));
+        assert!(edited.added_at.is_none());
+        assert!(!edited.pinned);
+        assert_eq!(edited.source_session, r.id);
+        assert_eq!(edited.source_action, r.actions[0].id);
+        assert_eq!(
+            s.load(r.id).await.unwrap().actions[0].title,
+            r.actions[0].title
+        );
+        copy_action(
+            Extract(s.clone()),
+            Json(CopyAction {
+                session: r.id,
+                action: r.actions[0].id,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.globals().await.unwrap().len(), 1);
+        assert_eq!(
+            s.globals().await.unwrap()[0].action.title,
+            "Independently edited"
+        );
+        tokio::fs::remove_dir_all(s.root).await.unwrap();
     }
     #[tokio::test]
     async fn archive_retention_uses_archive_date_restores_and_preserves_global_actions() {

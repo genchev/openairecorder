@@ -15,7 +15,7 @@ with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED, strict_times
     archive.write(compiler / 'x86_64-w64-mingw32/bin/libunwind.dll', f'{prefix}/libunwind.dll')
     archive.write(tools / 'llvm-LICENSE.txt', f'{prefix}/licenses/LLVM.txt')
     archive.write(compiler / 'x86_64-w64-mingw32/share/mingw32/COPYING', f'{prefix}/licenses/mingw-w64.txt')
-    for name in ['README.md', 'VALIDATION.md', 'docs/screenshots/conversation-dark.png', 'docs/screenshots/conversation-light.png', 'docs/screenshots/gemini-settings.png', 'docs/screenshots/recording-controls-preview.png', 'docs/screenshots/library-archives.png']:
+    for name in ['README.md', 'VALIDATION.md', 'docs/screenshots/conversation-dark.png', 'docs/screenshots/conversation-light.png', 'docs/screenshots/gemini-settings.png', 'docs/screenshots/recording-controls-preview.png', 'docs/screenshots/library-archives.png', 'docs/screenshots/global-actions-dark.png', 'docs/screenshots/global-actions-light.png', 'docs/screenshots/global-task-editor.png']:
         archive.write(repo / name, f'{prefix}/{name}')
     archive.write(repo / 'assets/fonts/OFL.txt', f'{prefix}/licenses/Inter-OFL.txt')
     registry = tools / 'cargo/registry/src'
@@ -53,9 +53,15 @@ retry/recovery. Use Retry pending audio after key/model/quota/network errors.
 
 Your key is encrypted for your Windows account and stored separately from
 recordings and Markdown. Audio/notes themselves are not encrypted. Recordings
-normally live under %LOCALAPPDATA%\OpenAIRecorder
-ecordings; older portable
+normally live under %LOCALAPPDATA%\OpenAIRecorder\recordings; older portable
 data is reused. The app never writes the API key into exports or provider URLs.
+
+Global Actions lets you add personal tasks and edit copied meeting tasks,
+set due dates with a calendar, pin, search, and sort by due or added date.
+Overdue/today/tomorrow tasks rise above pins; completed tasks stay last.
+Deadline indicators use your computer's local calendar date. Global edits
+never change the source meeting task. Older tasks without an added date
+remain editable; relative deadlines need an exact date for reminders.
 
 Existing/imported mono 16 kHz PCM16 WAV can be processed in minute batches.
 No ffmpeg or local speech-model installation is required.

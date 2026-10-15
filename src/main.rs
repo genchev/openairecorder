@@ -13,6 +13,7 @@ mod overlay;
 mod playback;
 mod secrets;
 mod segments;
+mod tasks;
 
 fn main() -> anyhow::Result<()> {
     let result = start();

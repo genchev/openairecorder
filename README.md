@@ -8,6 +8,16 @@ OpenAIRecorder 0.4 is a native Rust Windows app that sends recorded audio direct
 
 Extract the ZIP and double-click `openairecorder.exe`. Keep `libunwind.dll` beside it. No setup scripts, Rust, or local speech models are required.
 
+## Global Actions
+
+Use **+ New task** to create personal tasks, or add a meeting action to the global list. **Edit** changes its title, owner, and optional due date. Choose a date from the calendar, type `YYYY-MM-DD`, use Today/Tomorrow/In 7 days, or clear it with No due date. Global edits and completion stay independent of the meeting's original action.
+
+**Pin** highlights a task and promotes it above ordinary tasks. Open overdue tasks come first, then tasks due today, then tomorrow, then pinned tasks, then the remaining open tasks. Completed tasks stay last and lose deadline urgency; Hide completed removes them from view. Date labels and highlighting distinguish overdue, today, and tomorrow using the computer's **local calendar date**, and update automatically while the app runs.
+
+Search covers task titles, owners, due dates, and source conversation names. Sort by due date (soonest/latest) or added date (newest/oldest) within priority groups. When sorting by due date, tasks without an exact date sort after dated tasks within their group. Older global actions without a recorded added date remain editable and display Added date unavailable; the app does not invent a historical date. Meeting deadlines such as “Friday” are kept as suggestions until you choose an exact calendar date; editing only a title/owner preserves that original suggestion.
+
+[Dark task list](docs/screenshots/global-actions-dark.png) · [Light task list](docs/screenshots/global-actions-light.png) · [Task editor and calendar](docs/screenshots/global-task-editor.png). These screenshots use native Linux rendering with isolated demo tasks.
+
 ## Gemini settings
 
 Open Settings, enter your **Gemini API key**, and refresh the available models. Choose an audio-capable model from your account's list, or enter a custom model ID. By default the same model transcribes audio and returns structured Markdown notes and actions.

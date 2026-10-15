@@ -18,6 +18,41 @@ enum View {
     Actions,
     Settings,
 }
+struct TaskEditor {
+    id: Option<Uuid>,
+    title: String,
+    owner: String,
+    due: String,
+    suggested_due: Option<String>,
+    due_changed: bool,
+    calendar_month: chrono::NaiveDate,
+}
+impl TaskEditor {
+    fn new(task: Option<&app::GlobalAction>) -> Self {
+        Self {
+            id: task.map(|g| g.id),
+            title: task.map(|g| g.action.title.clone()).unwrap_or_default(),
+            owner: task
+                .and_then(|g| g.action.owner.clone())
+                .unwrap_or_default(),
+            due: task
+                .and_then(crate::tasks::due)
+                .map(|d| d.to_string())
+                .unwrap_or_default(),
+            due_changed: false,
+            calendar_month: {
+                use chrono::Datelike;
+                task.and_then(crate::tasks::due)
+                    .unwrap_or_else(|| chrono::Local::now().date_naive())
+                    .with_day(1)
+                    .unwrap()
+            },
+            suggested_due: task
+                .filter(|g| crate::tasks::due(g).is_none())
+                .and_then(|g| g.action.due.clone()),
+        }
+    }
+}
 enum Message {
     Snapshot(u64, Result<Snapshot, String>, Option<(Uuid, String)>),
     GeminiCheck(Result<(Vec<String>, bool), String>, bool),
@@ -55,6 +90,9 @@ pub struct Desktop {
     notice: String,
     theme: String,
     hide_completed: bool,
+    task_search: String,
+    task_sort: crate::tasks::Sort,
+    task_editor: Option<TaskEditor>,
     busy: bool,
     epoch: u64,
     queued: VecDeque<Command>,
@@ -133,6 +171,9 @@ impl Desktop {
             notice: String::new(),
             theme: "system".into(),
             hide_completed: false,
+            task_search: String::new(),
+            task_sort: crate::tasks::Sort::default(),
+            task_editor: None,
             busy: false,
             epoch: 0,
             queued: VecDeque::new(),
@@ -460,6 +501,9 @@ impl Desktop {
                         Ok(outcome) => {
                             if self.notes_save_pending {
                                 self.notes_dirty = false;
+                            }
+                            if outcome.message == "Global task saved" {
+                                self.task_editor = None;
                             }
                             self.notice = outcome.message;
                             if self.notice == "Gemini settings saved" {
@@ -1444,7 +1488,7 @@ if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
         }
     }
     fn actions_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        design::eyebrow(ui, "ALL YOUR CONVERSATIONS");
+        design::eyebrow(ui, "YOUR PERSONAL ACTION LIST");
         ui.label(
             egui::RichText::new("A little less on your mind.")
                 .size(34.0)
@@ -1452,31 +1496,128 @@ if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
         );
         design::subtitle(
             ui,
-            "One list for the next steps that matter. Each action keeps a link to its conversation.",
+            "Meeting follow-ups and your own tasks, together. Edit freely; meeting originals stay unchanged.",
         );
-        ui.add_space(24.0);
-        let total = self.data.actions.len();
-        let done = self.data.actions.iter().filter(|a| a.action.done).count();
+        ui.add_space(18.0);
         ui.horizontal_wrapped(|ui| {
-            design::pill(ui, &format!("{} OPEN", total - done), ACCENT);
+            if ui
+                .add_enabled(
+                    !self.busy && self.task_editor.is_none(),
+                    design::primary("+ New task"),
+                )
+                .clicked()
+            {
+                self.notice.clear();
+                self.task_editor = Some(TaskEditor::new(None));
+            }
+            let done = self.data.actions.iter().filter(|g| g.action.done).count();
+            design::pill(
+                ui,
+                &format!("{} OPEN", self.data.actions.len() - done),
+                ACCENT,
+            );
             design::pill(
                 ui,
                 &format!("{done} COMPLETE"),
-                egui::Color32::from_rgb(49, 158, 125),
+                if ui.visuals().dark_mode {
+                    design::MINT
+                } else {
+                    egui::Color32::from_rgb(30, 119, 86)
+                },
             );
             ui.checkbox(&mut self.hide_completed, "Hide completed");
         });
-        ui.add_space(18.0);
-        let actions = self.data.actions.clone();
+        ui.add_space(12.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.task_search)
+                    .hint_text("Search tasks, owners, dates or conversations…")
+                    .desired_width(350.0),
+            );
+            egui::ComboBox::from_id_salt("global-task-sort")
+                .selected_text(self.task_sort.label())
+                .show_ui(ui, |ui| {
+                    for sort in [
+                        crate::tasks::Sort::DueSoonest,
+                        crate::tasks::Sort::DueLatest,
+                        crate::tasks::Sort::AddedNewest,
+                        crate::tasks::Sort::AddedOldest,
+                    ] {
+                        ui.selectable_value(&mut self.task_sort, sort, sort.label());
+                    }
+                });
+        });
+        design::subtitle(
+            ui,
+            "Urgent tasks first, then pins. Sort applies within groups; completed tasks stay last.",
+        );
+        ui.add_space(14.0);
+        let today = chrono::Local::now().date_naive();
+        let mut actions: Vec<_> = self
+            .data
+            .actions
+            .iter()
+            .filter(|g| {
+                (!self.hide_completed || !g.action.done)
+                    && crate::tasks::matches(g, &self.task_search)
+            })
+            .cloned()
+            .collect();
+        crate::tasks::sort(&mut actions, today, self.task_sort);
+        let mut last_group = None;
         for g in &actions {
-            if self.hide_completed && g.action.done {
-                continue;
+            let priority = crate::tasks::priority(g, today);
+            let group = if priority < 3 { 0 } else { priority };
+            if last_group != Some(group) {
+                ui.add_space(6.0);
+                design::eyebrow(
+                    ui,
+                    match group {
+                        0 => "NEEDS ATTENTION",
+                        3 => "PINNED",
+                        5 => "COMPLETED",
+                        _ => "TASKS",
+                    },
+                );
+                ui.add_space(6.0);
+                last_group = Some(group);
             }
-            design::card(ui).show(ui, |ui| {
+            let dark = ui.visuals().dark_mode;
+            let highlight = match priority {
+                0 => Some(if dark {
+                    egui::Color32::from_rgb(241, 131, 145)
+                } else {
+                    egui::Color32::from_rgb(179, 42, 59)
+                }),
+                1 => Some(if dark {
+                    egui::Color32::from_rgb(237, 198, 110)
+                } else {
+                    egui::Color32::from_rgb(145, 88, 16)
+                }),
+                2 => Some(if dark {
+                    egui::Color32::from_rgb(210, 197, 119)
+                } else {
+                    egui::Color32::from_rgb(127, 101, 17)
+                }),
+                _ if g.pinned && !g.action.done => Some(ACCENT),
+                _ => None,
+            };
+            let mut card = design::card(ui).inner_margin(egui::Margin::symmetric(18, 12));
+            if let Some(color) = highlight {
+                card = card.stroke(egui::Stroke::new(1.2_f32, color)).fill(
+                    ui.visuals().panel_fill.blend(
+                        color.gamma_multiply(if ui.visuals().dark_mode { 0.11 } else { 0.06 }),
+                    ),
+                );
+            }
+            card.show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 5.0;
+                ui.spacing_mut().interact_size.y = 26.0;
+                ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
                 ui.set_width(ui.available_width());
                 ui.horizontal_wrapped(|ui| {
-                    let mut checked = g.action.done;
-                    let text = if checked {
+                    let mut done = g.action.done;
+                    let text = if done {
                         egui::RichText::new(&g.action.title)
                             .size(17.0)
                             .strikethrough()
@@ -1485,57 +1626,88 @@ if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
                         egui::RichText::new(&g.action.title).size(17.0)
                     };
                     if ui
-                        .add_enabled(!self.busy, egui::Checkbox::new(&mut checked, text))
+                        .add_enabled(!self.busy, egui::Checkbox::new(&mut done, text))
                         .changed()
                     {
-                        self.dispatch(
-                            Command::GlobalComplete {
-                                id: g.id,
-                                done: checked,
-                            },
-                            ctx,
-                        );
+                        self.dispatch(Command::GlobalComplete { id: g.id, done }, ctx);
+                    }
+                    if g.pinned {
+                        design::pill(ui, "PINNED", ACCENT);
                     }
                 });
+                if let Some(label) = crate::tasks::deadline_label(g, today) {
+                    ui.label(
+                        egui::RichText::new(label)
+                            .color(highlight.unwrap_or_else(|| design::muted(ui)))
+                            .strong(),
+                    );
+                }
                 ui.horizontal_wrapped(|ui| {
-                    if self.data.sessions.iter().any(|r| r.id == g.source_session) {
+                    if g.source_session.is_nil() {
+                        design::subtitle(ui, "Personal task");
+                    } else if self.data.sessions.iter().any(|r| r.id == g.source_session) {
                         if ui.link(&g.source_title).clicked() {
                             self.navigate(View::Session(g.source_session));
                         }
                     } else {
-                        design::subtitle(ui, &format!("{} · archived source", g.source_title));
+                        design::subtitle(ui, &format!("{} · source removed", g.source_title));
                     }
                     if let Some(owner) = &g.action.owner {
-                        design::subtitle(ui, owner);
+                        design::subtitle(ui, &format!("Owner: {owner}"));
                     }
-                    if let Some(due) = &g.action.due {
-                        design::subtitle(ui, &format!("Due {due}"));
+                    design::subtitle(
+                        ui,
+                        &g.added_at
+                            .as_ref()
+                            .map(|d| format!("Added {}", date(d)))
+                            .unwrap_or_else(|| "Added date unavailable (older task)".into()),
+                    );
+                });
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            !self.busy && self.task_editor.is_none(),
+                            egui::Button::new("Edit").small(),
+                        )
+                        .clicked()
+                    {
+                        self.notice.clear();
+                        self.task_editor = Some(TaskEditor::new(Some(g)));
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add_enabled(!self.busy, egui::Button::new("Remove").small())
-                            .clicked()
-                        {
-                            self.dispatch(Command::GlobalRemove(g.id), ctx);
-                        }
-                    });
+                    if ui
+                        .add_enabled(
+                            !self.busy,
+                            egui::Button::new(if g.pinned { "Unpin" } else { "Pin" }).small(),
+                        )
+                        .clicked()
+                    {
+                        self.dispatch(
+                            Command::GlobalPin {
+                                id: g.id,
+                                pinned: !g.pinned,
+                            },
+                            ctx,
+                        );
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.busy && self.task_editor.is_none(),
+                            egui::Button::new("Remove").small(),
+                        )
+                        .clicked()
+                    {
+                        self.dispatch(Command::GlobalRemove(g.id), ctx);
+                    }
                 });
             });
-            ui.add_space(10.0);
+            ui.add_space(8.0);
         }
         if actions.is_empty() {
-            design::card(ui).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.add_space(24.0);
-                ui.heading("Your next steps, all together.");
-                design::subtitle(
-                    ui,
-                    "Open a conversation and add its open action items to this list.",
-                );
-                ui.add_space(24.0);
-            });
-        } else if self.hide_completed && total == done {
-            design::subtitle(ui, "Everything is checked off. Enjoy the clear list.");
+            design::card(ui).show(ui,|ui| {
+            ui.set_width(ui.available_width());ui.heading(if self.data.actions.is_empty() { "Your next steps, all together." } else { "No matching tasks." });
+            design::subtitle(ui,"Create a task above, add one from a conversation, or adjust your search and completed filter.");
+        });
         }
     }
     fn settings_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1620,6 +1792,54 @@ if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
         });
     }
     fn dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(mut editor) = self.task_editor.take() {
+            let mut open = true;
+            let mut cancel = false;
+            egui::Window::new(if editor.id.is_some() { "Edit global task" } else { "New task" })
+                .id(egui::Id::new("global-task-editor")).open(&mut open).collapsible(false).resizable(false).default_width(440.0)
+                .show(ctx,|ui| {
+                    ui.add_enabled_ui(!self.busy,|ui| {
+                        ui.label("Task"); ui.add(egui::TextEdit::multiline(&mut editor.title).char_limit(2000).desired_rows(2).desired_width(420.0).hint_text("What needs to happen?"));
+                        ui.label("Owner (optional)"); ui.add(egui::TextEdit::singleline(&mut editor.owner).char_limit(200).desired_width(420.0));
+                        ui.label("Due date (optional · YYYY-MM-DD)");
+                        ui.horizontal(|ui| {
+                            if ui.add(egui::TextEdit::singleline(&mut editor.due).hint_text("YYYY-MM-DD").desired_width(180.0)).changed() {
+                                editor.due_changed=true;
+                                if let Some(date)=crate::tasks::parse_due(&editor.due) {
+                                    use chrono::Datelike; editor.calendar_month=date.with_day(1).unwrap();
+                                }
+                            }
+                            ui.menu_button("Calendar…",|ui| {
+                                if task_calendar(ui,&mut editor.calendar_month,&mut editor.due) { editor.due_changed=true; }
+                            });
+                        });
+                        if let Some(suggestion) = &editor.suggested_due { design::subtitle(ui,&format!("Original deadline: {suggestion}. Set a calendar date for reminders.")); }
+                        ui.horizontal_wrapped(|ui| {
+                            let today=chrono::Local::now().date_naive();
+                            for (label,days) in [("Today",0),("Tomorrow",1),("In 7 days",7)] {
+                                if ui.button(label).clicked() { editor.due=(today+chrono::Duration::days(days)).to_string(); editor.due_changed=true;
+                                    use chrono::Datelike; editor.calendar_month=crate::tasks::parse_due(&editor.due).unwrap().with_day(1).unwrap(); }
+                            }
+                            if ui.button("No due date").clicked() { editor.due.clear(); editor.due_changed=true; }
+                        });
+                        let valid_due=editor.due.trim().is_empty() || crate::tasks::parse_due(editor.due.trim()).is_some();
+                        if !valid_due { ui.colored_label(egui::Color32::from_rgb(220,83,105),"Use a valid calendar date: YYYY-MM-DD."); }
+                        let valid=valid_due && !editor.title.trim().is_empty() && editor.title.trim().chars().count()<=2000 && editor.owner.trim().chars().count()<=200;
+                        if !self.notice.is_empty() { design::subtitle(ui,&self.notice); }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(valid,design::primary("Save task")).clicked() {
+                                self.dispatch(Command::GlobalSave { id:editor.id,title:editor.title.clone(),owner:editor.owner.clone(),due:if editor.due_changed || editor.suggested_due.is_none() { Some(editor.due.clone()) } else { None } },ctx);
+                            }
+                            if ui.button("Cancel").clicked() { cancel=true; }
+                        });
+                    });
+                });
+            if open && !cancel {
+                self.task_editor = Some(editor);
+            }
+        }
+
         if self.pending_navigation.is_some() {
             egui::Window::new("Unsaved notes")
                 .collapsible(false)
@@ -1687,6 +1907,63 @@ impl Drop for Desktop {
         self.state.overlay.hide();
     }
 }
+fn task_calendar(ui: &mut egui::Ui, month: &mut chrono::NaiveDate, selected: &mut String) -> bool {
+    use chrono::Datelike;
+    ui.spacing_mut().button_padding = egui::vec2(3.0, 3.0);
+    ui.spacing_mut().interact_size = egui::vec2(28.0, 28.0);
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        if ui.button("‹").clicked()
+            && let Some(previous) = month.checked_sub_months(chrono::Months::new(1))
+        {
+            *month = previous;
+        }
+        ui.label(month.format("%B %Y").to_string());
+        if ui.button("›").clicked()
+            && let Some(next) = month.checked_add_months(chrono::Months::new(1))
+        {
+            *month = next;
+        }
+    });
+    egui::Grid::new("task-date-calendar")
+        .spacing(egui::vec2(4.0, 4.0))
+        .show(ui, |ui| {
+            for day in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"] {
+                ui.add_sized(
+                    [28.0, 28.0],
+                    egui::Label::new(egui::RichText::new(day).strong()),
+                );
+            }
+            ui.end_row();
+            let offset = month.weekday().num_days_from_monday();
+            for cell in 0..42 {
+                let date = month.checked_add_signed(chrono::Duration::days(
+                    i64::from(cell) - i64::from(offset),
+                ));
+                if let Some(date) = date.filter(|d| d.month() == month.month()) {
+                    if ui
+                        .add_sized(
+                            [28.0, 28.0],
+                            egui::Button::new(date.day().to_string())
+                                .selected(*selected == date.to_string()),
+                        )
+                        .clicked()
+                    {
+                        *selected = date.to_string();
+                        changed = true;
+                        ui.close();
+                    }
+                } else {
+                    ui.add_sized([28.0, 28.0], egui::Label::new(""));
+                }
+                if cell % 7 == 6 {
+                    ui.end_row();
+                }
+            }
+        });
+    changed
+}
+
 #[derive(Clone, Copy)]
 enum LibraryAction {
     Select(Uuid),
@@ -2021,6 +2298,53 @@ fn date(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn calendar_dates_align_with_their_weekdays() {
+        fn center(shape: &egui::Shape, text: &str) -> Option<f32> {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text() == text => {
+                    Some(t.pos.x + t.galley.size().x / 2.0)
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| center(s, text)),
+                _ => None,
+            }
+        }
+        let ctx = egui::Context::default();
+        for (first, weekday) in [("2026-10-01", "Th"), ("2028-02-01", "Tu")] {
+            let mut month = crate::tasks::parse_due(first).unwrap();
+            let mut selected = String::new();
+            for _ in 0..2 {
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(400.0, 400.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            task_calendar(ui, &mut month, &mut selected);
+                        });
+                    },
+                );
+                let day = output
+                    .shapes
+                    .iter()
+                    .find_map(|s| center(&s.shape, "1"))
+                    .unwrap();
+                let header = output
+                    .shapes
+                    .iter()
+                    .find_map(|s| center(&s.shape, weekday))
+                    .unwrap();
+                assert!(
+                    (day - header).abs() < 1.0,
+                    "first day must align with {weekday}: {day} vs {header}"
+                );
+            }
+        }
+    }
     #[test]
     fn native_panels_render_headlessly_and_themes_switch() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
