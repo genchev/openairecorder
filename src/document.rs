@@ -306,3 +306,84 @@ mod point_tests {
         assert_eq!(tasks(&again).len(), 3);
     }
 }
+
+/// Hide checklist sections already represented by the structured action panel.
+/// Returns display ranges only; the stored Markdown remains intact.
+pub fn duplicate_action_sections(
+    markdown: &str,
+    represented: impl Fn(&str) -> bool,
+) -> Vec<Range<usize>> {
+    let mut heading = None;
+    let mut name = String::new();
+    let mut section = None;
+    let mut ranges = Vec::new();
+    for (event, range) in Parser::new(markdown).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                if let Some((start, depth)) = section
+                    && level <= depth
+                {
+                    ranges.push(start..range.start);
+                    section = None;
+                }
+                heading = Some((range.start, level));
+                name.clear();
+            }
+            Event::Text(text) | Event::Code(text) if heading.is_some() => name.push_str(&text),
+            Event::End(TagEnd::Heading(_)) => {
+                if [
+                    "action items",
+                    "action points",
+                    "actions",
+                    "действия",
+                    "задачи",
+                    "точки за действие",
+                ]
+                .contains(&name.trim().trim_end_matches(':').to_lowercase().as_str())
+                    && section.is_none()
+                {
+                    section = heading;
+                }
+                heading = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some((start, _)) = section {
+        ranges.push(start..markdown.len());
+    }
+    ranges.retain(|range| {
+        let list = tasks(&markdown[range.clone()]);
+        !list.is_empty() && list.iter().all(|task| represented(&task.title))
+    });
+    ranges
+}
+#[cfg(test)]
+mod duplicate_section_tests {
+    use super::*;
+    #[test]
+    fn only_represented_action_sections_are_hidden_and_other_notes_remain_intact() {
+        let md = "## Key Points\n- Keep this.\n## Action items\n- [x] Done\n- [ ] Next\n## Decisions\n- Keep decision.\n## Action Points\n- [ ] Unknown\n";
+        let ranges = duplicate_action_sections(md, |title| ["Done", "Next"].contains(&title));
+        assert_eq!(ranges.len(), 1);
+        let visible = format!("{}{}", &md[..ranges[0].start], &md[ranges[0].end..]);
+        assert!(!visible.contains("## Action items"));
+        assert!(visible.contains("Keep decision."));
+        assert!(visible.contains("Unknown"));
+        assert!(md.contains("- [x] Done"));
+        assert!(
+            duplicate_action_sections("## Actions\nImportant explanation, without tasks.", |_| {
+                true
+            })
+            .is_empty()
+        );
+        assert!(
+            duplicate_action_sections("```md\n## Action items\n- [ ] Fake\n```", |_| true)
+                .is_empty()
+        );
+        assert_eq!(
+            duplicate_action_sections("## Задачи\n- [ ] Следваща\n", |_| true).len(),
+            1
+        );
+    }
+}

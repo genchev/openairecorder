@@ -1500,7 +1500,7 @@ if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
         let editable = !busy && r.status != "recording";
         for point in points {
             let mut prefix = r.notes[cursor..point.range.start].to_owned();
-            changed |= note_markdown(ui, &mut self.markdown_cache, &mut prefix, editable);
+            changed |= note_markdown(ui, &mut self.markdown_cache, &mut prefix, editable, r);
             document.push_str(&prefix);
             let mut item = r.notes[point.range.clone()].to_owned();
             let normalized = crate::document::action_title(&point.title);
@@ -1519,7 +1519,7 @@ if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
                         egui::Layout::top_down(egui::Align::LEFT),
                         |ui| {
                             changed |=
-                                note_markdown(ui, &mut self.markdown_cache, &mut item, editable);
+                                note_markdown(ui, &mut self.markdown_cache, &mut item, editable, r);
                         },
                     );
                     if ui
@@ -1558,7 +1558,7 @@ if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
             cursor = point.range.end;
         }
         let mut tail = r.notes[cursor..].to_owned();
-        changed |= note_markdown(ui, &mut self.markdown_cache, &mut tail, editable);
+        changed |= note_markdown(ui, &mut self.markdown_cache, &mut tail, editable, r);
         document.push_str(&tail);
         if changed && editable {
             self.dispatch(
@@ -2084,16 +2084,50 @@ fn note_markdown(
     cache: &mut egui_commonmark::CommonMarkCache,
     text: &mut String,
     enabled: bool,
+    r: &app::Recording,
 ) -> bool {
     if text.is_empty() {
         return false;
     }
-    ui.add_enabled_ui(enabled, |ui| {
-        egui_commonmark::CommonMarkViewer::new().show_mut(ui, cache, text)
-    })
-    .inner
-    .response
-    .changed()
+    let hidden = crate::document::duplicate_action_sections(text, |title| {
+        let title = crate::document::action_title(title);
+        r.actions
+            .iter()
+            .any(|a| crate::document::action_title(&a.title) == title)
+            || r.note_actions
+                .get(&title)
+                .is_some_and(|id| r.actions.iter().any(|a| a.id == *id))
+    });
+    let original = std::mem::take(text);
+    let mut cursor = 0;
+    let mut changed = false;
+    for range in hidden {
+        let mut visible = original[cursor..range.start].to_owned();
+        if !visible.trim().is_empty() {
+            changed |= ui
+                .add_enabled_ui(enabled, |ui| {
+                    egui_commonmark::CommonMarkViewer::new().show_mut(ui, cache, &mut visible)
+                })
+                .inner
+                .response
+                .changed();
+        }
+        text.push_str(&visible);
+        text.push_str(&original[range.clone()]);
+        cursor = range.end;
+    }
+    let mut visible = original[cursor..].to_owned();
+    if !visible.trim().is_empty() {
+        changed |= ui
+            .add_enabled_ui(enabled, |ui| {
+                egui_commonmark::CommonMarkViewer::new().show_mut(ui, cache, &mut visible)
+            })
+            .inner
+            .response
+            .changed();
+    }
+    text.push_str(&visible);
+    changed
 }
 
 fn task_calendar(ui: &mut egui::Ui, month: &mut chrono::NaiveDate, selected: &mut String) -> bool {
