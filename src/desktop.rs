@@ -1455,25 +1455,7 @@ if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
                 }
                 ui.add_space(16.0);
             } else {
-                let mut document = r.notes.clone();
-                let response = ui
-                    .add_enabled_ui(!busy && r.status != "recording", |ui| {
-                        egui_commonmark::CommonMarkViewer::new().show_mut(
-                            ui,
-                            &mut self.markdown_cache,
-                            &mut document,
-                        )
-                    })
-                    .inner;
-                if response.response.changed() && !busy && r.status != "recording" {
-                    self.dispatch(
-                        Command::Notes {
-                            id: r.id,
-                            notes: document,
-                        },
-                        ctx,
-                    );
-                }
+                self.notes_document(ui, ctx, r, busy);
             }
             ui.add_space(12.0);
             egui::CollapsingHeader::new("Edit Markdown").show(ui, |ui| {
@@ -1503,6 +1485,90 @@ if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
                 }
             });
         });
+    }
+    fn notes_document(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        r: &app::Recording,
+        busy: bool,
+    ) {
+        let points = crate::document::note_points(&r.notes);
+        let mut document = String::new();
+        let mut cursor = 0;
+        let mut changed = false;
+        let editable = !busy && r.status != "recording";
+        for point in points {
+            let mut prefix = r.notes[cursor..point.range.start].to_owned();
+            changed |= note_markdown(ui, &mut self.markdown_cache, &mut prefix, editable);
+            document.push_str(&prefix);
+            let mut item = r.notes[point.range.clone()].to_owned();
+            let normalized = crate::document::action_title(&point.title);
+            let exists = r
+                .note_actions
+                .get(&normalized)
+                .is_some_and(|id| r.actions.iter().any(|a| a.id == *id))
+                || r.actions
+                    .iter()
+                    .any(|a| crate::document::action_title(&a.title) == normalized);
+            ui.push_id(("note-point", r.id, point.range.start), |ui| {
+                let width = (ui.available_width() - 38.0).max(80.0);
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(width, 0.0),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
+                            changed |=
+                                note_markdown(ui, &mut self.markdown_cache, &mut item, editable);
+                        },
+                    );
+                    if ui
+                        .add_enabled_ui(!busy && !self.notes_dirty && !exists, |ui| {
+                            ui.spacing_mut().button_padding = egui::vec2(4.0, 2.0);
+                            ui.spacing_mut().interact_size = egui::vec2(26.0, 26.0);
+                            ui.add_sized(
+                                [26.0, 26.0],
+                                egui::Button::new(if exists { "✓" } else { "+" }).corner_radius(7),
+                            )
+                        })
+                        .inner
+                        .on_hover_text(if exists {
+                            "Already added to Action items"
+                        } else {
+                            "Create Action item from this point"
+                        })
+                        .on_disabled_hover_text(if exists {
+                            "Already added to Action items"
+                        } else {
+                            "Save edits or wait for the current operation"
+                        })
+                        .clicked()
+                    {
+                        self.dispatch(
+                            Command::ActionFromNote {
+                                id: r.id,
+                                title: point.title.clone(),
+                            },
+                            ctx,
+                        );
+                    }
+                });
+            });
+            document.push_str(&item);
+            cursor = point.range.end;
+        }
+        let mut tail = r.notes[cursor..].to_owned();
+        changed |= note_markdown(ui, &mut self.markdown_cache, &mut tail, editable);
+        document.push_str(&tail);
+        if changed && editable {
+            self.dispatch(
+                Command::Notes {
+                    id: r.id,
+                    notes: document,
+                },
+                ctx,
+            );
+        }
     }
     fn session_actions(
         &mut self,
@@ -2013,6 +2079,23 @@ impl Drop for Desktop {
         self.state.overlay.hide();
     }
 }
+fn note_markdown(
+    ui: &mut egui::Ui,
+    cache: &mut egui_commonmark::CommonMarkCache,
+    text: &mut String,
+    enabled: bool,
+) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    ui.add_enabled_ui(enabled, |ui| {
+        egui_commonmark::CommonMarkViewer::new().show_mut(ui, cache, text)
+    })
+    .inner
+    .response
+    .changed()
+}
+
 fn task_calendar(ui: &mut egui::Ui, month: &mut chrono::NaiveDate, selected: &mut String) -> bool {
     use chrono::Datelike;
     ui.spacing_mut().button_padding = egui::vec2(3.0, 3.0);
@@ -2498,6 +2581,7 @@ mod tests {
             error: None,
             pinned: false,
             archived_at: None,
+            note_actions: Default::default(),
             audio_type: "audio/wav".into(),
             actions: vec![],
         };

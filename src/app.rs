@@ -33,6 +33,8 @@ pub struct Recording {
     pub pinned: bool,
     #[serde(default)]
     pub archived_at: Option<String>,
+    #[serde(default)]
+    pub note_actions: std::collections::HashMap<String, Uuid>,
     #[serde(default = "default_audio_type")]
     pub audio_type: String,
     #[serde(default)]
@@ -174,6 +176,10 @@ pub(crate) mod desktop_api {
         GlobalComplete {
             id: Uuid,
             done: bool,
+        },
+        ActionFromNote {
+            id: Uuid,
+            title: String,
         },
         GlobalSave {
             id: Option<Uuid>,
@@ -403,6 +409,7 @@ pub(crate) mod desktop_api {
                     error: None,
                     pinned: false,
                     archived_at: None,
+                    note_actions: Default::default(),
                     audio_type: audio_type.into(),
                     actions: vec![],
                 };
@@ -483,6 +490,40 @@ pub(crate) mod desktop_api {
                 global_toggle(state, Path(id), Json(Toggle { done }))
                     .await
                     .map_err(|e| e.1)?;
+            }
+            Command::ActionFromNote { id, title } => {
+                let _lock = s.jobs.lock().await;
+                let mut r = s.load(id).await.map_err(|e| e.1)?;
+                let normalized = crate::document::action_title(&title);
+                let point = crate::document::note_points(&r.notes)
+                    .into_iter()
+                    .find(|p| crate::document::action_title(&p.title) == normalized)
+                    .ok_or("This point changed. Refresh the notes and try again.")?;
+                let linked = r
+                    .note_actions
+                    .get(&normalized)
+                    .is_some_and(|id| r.actions.iter().any(|a| a.id == *id));
+                if !linked
+                    && !r
+                        .actions
+                        .iter()
+                        .any(|a| crate::document::action_title(&a.title) == normalized)
+                {
+                    r.notes = crate::document::append_action(&r.notes, &point.title);
+                    let action_id = Uuid::new_v4();
+                    r.note_actions.insert(normalized, action_id);
+                    r.actions.push(Action {
+                        id: action_id,
+                        title: point.title,
+                        owner: None,
+                        due: None,
+                        done: false,
+                    });
+                    s.save(&r).await.map_err(|e| e.to_string())?;
+                    outcome.message = "Action item created from note".into();
+                } else {
+                    outcome.message = "This point already has an action item".into();
+                }
             }
             Command::GlobalSave {
                 id,
@@ -1203,6 +1244,7 @@ async fn upload(
         error: None,
         pinned: false,
         archived_at: None,
+        note_actions: Default::default(),
         audio_type,
         actions: vec![],
     };
@@ -1461,6 +1503,7 @@ mod tests {
             error: None,
             pinned: false,
             archived_at: None,
+            note_actions: Default::default(),
             audio_type: "audio/wav".into(),
             actions: vec![Action {
                 id: Uuid::new_v4(),
@@ -1472,6 +1515,108 @@ mod tests {
         };
         s.save(&r).await.unwrap();
         (s, r)
+    }
+    #[tokio::test]
+    async fn note_points_create_persistent_actions_once_and_keep_original_notes_and_global_copy() {
+        use desktop_api::{Command, execute};
+        let (s, mut r) = fixture().await;
+        r.notes="## Key Points\n- **Изпрати** офертата.\n## Decisions\n- Release next week.\n## Open Questions\n- Who owns testing?\n".into();
+        s.save(&r).await.unwrap();
+        for _ in 0..2 {
+            execute(
+                &s,
+                Command::ActionFromNote {
+                    id: r.id,
+                    title: "Изпрати офертата.".into(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let saved = s.load(r.id).await.unwrap();
+        assert_eq!(saved.actions.len(), 2);
+        let action = saved
+            .actions
+            .iter()
+            .find(|a| a.title == "Изпрати офертата.")
+            .unwrap();
+        assert!(!action.done && action.owner.is_none() && action.due.is_none());
+        assert!(saved.notes.starts_with(&r.notes));
+        assert_eq!(crate::document::tasks(&saved.notes).len(), 1);
+        execute(
+            &s,
+            Command::Complete {
+                id: r.id,
+                action: action.id,
+                done: true,
+            },
+        )
+        .await
+        .unwrap();
+        execute(
+            &s,
+            Command::ActionFromNote {
+                id: r.id,
+                title: "изпрати ОФЕРТАТА.".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let checked = s.load(r.id).await.unwrap();
+        assert!(
+            checked
+                .actions
+                .iter()
+                .find(|a| a.id == action.id)
+                .unwrap()
+                .done
+        );
+        execute(
+            &s,
+            Command::Copy {
+                id: r.id,
+                action: action.id,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.globals().await.unwrap()[0].source_action, action.id);
+        let mut rewritten = s.load(r.id).await.unwrap();
+        rewritten
+            .actions
+            .iter_mut()
+            .find(|a| a.id == action.id)
+            .unwrap()
+            .title = "AI-refined task wording".into();
+        s.save(&rewritten).await.unwrap();
+        execute(
+            &s,
+            Command::ActionFromNote {
+                id: r.id,
+                title: "Изпрати офертата.".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.load(r.id).await.unwrap().actions.len(), 2);
+
+        assert!(
+            execute(
+                &s,
+                Command::ActionFromNote {
+                    id: r.id,
+                    title: "Not in the notes".into()
+                }
+            )
+            .await
+            .is_err()
+        );
+        let disk = tokio::fs::read_to_string(s.root.join(r.id.to_string()).join("notes.md"))
+            .await
+            .unwrap();
+        assert!(disk.contains("[x]"));
+        assert_eq!(s.load(r.id).await.unwrap().actions.len(), 2);
+        tokio::fs::remove_dir_all(s.root).await.unwrap();
     }
     #[tokio::test]
     async fn personal_tasks_validate_persist_and_edit_without_losing_completion_or_pin() {
