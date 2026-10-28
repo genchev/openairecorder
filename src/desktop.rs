@@ -1470,7 +1470,11 @@ impl Desktop {
                         }]
                     },
                 );
-                design::card(ui).show(ui,|ui|{ui.set_width(ui.available_width());ui.heading("Full transcript");ui.add_space(8.0);if r.transcript.is_empty(){design::subtitle(ui,"Gemini adds each minute here as it is processed. Language is detected automatically.");}else{egui_commonmark::CommonMarkViewer::new().show(ui,&mut self.markdown_cache,&r.transcript);ui.add_space(12.0);if ui.button("Copy transcript").clicked(){ctx.copy_text(r.transcript.clone());}
+                design::card(ui).show(ui,|ui|{ui.set_width(ui.available_width());ui.heading("Full transcript");ui.add_space(8.0);if r.transcript.is_empty(){design::subtitle(ui,"Gemini adds each minute here as it is processed. Language is detected automatically.");}else{let origin=ui.next_widget_position();let width=ui.available_width();let slot=ui.painter().add(egui::Shape::Noop);
+let mut glyphs=Vec::new();
+if self.transcript_search.jump.as_ref().is_some_and(|j|j.needs_geometry(ui,width)) { crate::search_jump::capture(ui,&mut self.markdown_cache,&r.transcript,&mut glyphs); }
+egui_commonmark::CommonMarkViewer::new().show(ui,&mut self.markdown_cache,&r.transcript);
+if let Some(jump)=self.transcript_search.jump.as_mut() { jump.finish(ui,origin,width,slot,&glyphs); }ui.add_space(12.0);if ui.button("Copy transcript").clicked(){ctx.copy_text(r.transcript.clone());}
 if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
             }
             _ => self.audio_ai_panel(ui, ctx, &r, busy),
@@ -1553,6 +1557,15 @@ if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
         r: &app::Recording,
         busy: bool,
     ) {
+        let origin = ui.next_widget_position();
+        let width = ui.available_width();
+        let slot = ui.painter().add(egui::Shape::Noop);
+        let track = self
+            .overview_search
+            .jump
+            .as_ref()
+            .is_some_and(|j| j.target.source_index == 0 && j.needs_geometry(ui, width));
+        let mut glyphs = Vec::new();
         let points = crate::document::note_points(&r.notes);
         let mut document = String::new();
         let mut cursor = 0;
@@ -1560,7 +1573,14 @@ if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
         let editable = !busy && r.status != "recording";
         for point in points {
             let mut prefix = r.notes[cursor..point.range.start].to_owned();
-            changed |= note_markdown(ui, &mut self.markdown_cache, &mut prefix, editable, r);
+            changed |= note_markdown(
+                ui,
+                &mut self.markdown_cache,
+                &mut prefix,
+                editable,
+                r,
+                track.then_some(&mut glyphs),
+            );
             document.push_str(&prefix);
             let mut item = r.notes[point.range.clone()].to_owned();
             let normalized = crate::document::action_title(&point.title);
@@ -1578,8 +1598,14 @@ if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
                         egui::vec2(width, 0.0),
                         egui::Layout::top_down(egui::Align::LEFT),
                         |ui| {
-                            changed |=
-                                note_markdown(ui, &mut self.markdown_cache, &mut item, editable, r);
+                            changed |= note_markdown(
+                                ui,
+                                &mut self.markdown_cache,
+                                &mut item,
+                                editable,
+                                r,
+                                track.then_some(&mut glyphs),
+                            );
                         },
                     );
                     if ui
@@ -1618,8 +1644,20 @@ if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
             cursor = point.range.end;
         }
         let mut tail = r.notes[cursor..].to_owned();
-        changed |= note_markdown(ui, &mut self.markdown_cache, &mut tail, editable, r);
+        changed |= note_markdown(
+            ui,
+            &mut self.markdown_cache,
+            &mut tail,
+            editable,
+            r,
+            track.then_some(&mut glyphs),
+        );
         document.push_str(&tail);
+        if let Some(jump) = self.overview_search.jump.as_mut()
+            && jump.target.source_index == 0
+        {
+            jump.finish(ui, origin, width, slot, &glyphs);
+        }
         if changed && editable {
             self.dispatch(
                 Command::Notes {
@@ -1643,7 +1681,8 @@ if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
             design::subtitle(ui,&format!("{done} of {total} complete"));
             if total>0{ui.add(egui::ProgressBar::new(done as f32/total as f32).fill(ACCENT).desired_height(4.0));}
             ui.add_space(8.0);
-            for a in &r.actions{
+            for (action_index,a) in r.actions.iter().enumerate(){
+                let row=ui.scope(|ui| {
                 let mut checked=a.done;
                 let text=if a.done{egui::RichText::new(&a.title).strikethrough().color(design::muted(ui))}else{egui::RichText::new(&a.title)};
                 if ui.add_enabled(!busy,egui::Checkbox::new(&mut checked,text)).changed(){self.dispatch(Command::Complete{id:r.id,action:a.id,done:checked},ctx);}
@@ -1651,6 +1690,8 @@ if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
                 if let Some(due)=&a.due{design::subtitle(ui,&format!("Due {due}"));}
                 let copied=self.data.actions.iter().any(|g|g.source_session==r.id&&g.source_action==a.id);
                 if !a.done&&ui.add_enabled(!busy&&!copied,egui::Button::new(if copied{"Added to global"}else{"+ Add to global"}).small()).clicked(){self.dispatch(Command::Copy{id:r.id,action:a.id},ctx);}
+                });
+                if let Some(jump)=self.overview_search.jump.as_mut() && jump.target.source_index==action_index+1 { jump.row(ui,row.response.rect); }
                 ui.add_space(8.0);ui.separator();ui.add_space(4.0);
             }
             if total==0{ui.add_space(12.0);design::subtitle(ui,"Action items will appear here when notes are ready. Imported Markdown checkboxes become actions too.");}
@@ -2204,7 +2245,7 @@ fn document_search(
         if !search.query.trim().is_empty()
             && let Some(hit) = search.hits.get(search.index)
         {
-            egui::Frame::new()
+            let result = egui::Frame::new()
                 .fill(design::surface(ui))
                 .stroke(egui::Stroke::new(1.0_f32, ACCENT))
                 .corner_radius(9)
@@ -2240,7 +2281,19 @@ fn document_search(
                         job.append("…", 0.0, normal);
                     }
                     ui.label(job);
+                    design::subtitle(ui, "Click to go to this match");
                 });
+            if ui
+                .interact(
+                    result.response.rect,
+                    ui.id().with("jump-to-result"),
+                    egui::Sense::click(),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+            {
+                search.request_jump(ui.input(|i| i.time));
+            }
         }
         ui.add_space(12.0);
     });
@@ -2252,6 +2305,7 @@ fn note_markdown(
     text: &mut String,
     enabled: bool,
     r: &app::Recording,
+    mut capture: Option<&mut Vec<crate::search_jump::Glyph>>,
 ) -> bool {
     if text.is_empty() {
         return false;
@@ -2271,6 +2325,9 @@ fn note_markdown(
     for range in hidden {
         let mut visible = original[cursor..range.start].to_owned();
         if !visible.trim().is_empty() {
+            if let Some(glyphs) = capture.as_mut() {
+                crate::search_jump::capture(ui, cache, &visible, glyphs);
+            }
             changed |= ui
                 .add_enabled_ui(enabled, |ui| {
                     egui_commonmark::CommonMarkViewer::new().show_mut(ui, cache, &mut visible)
@@ -2285,6 +2342,9 @@ fn note_markdown(
     }
     let mut visible = original[cursor..].to_owned();
     if !visible.trim().is_empty() {
+        if let Some(glyphs) = capture.as_mut() {
+            crate::search_jump::capture(ui, cache, &visible, glyphs);
+        }
         changed |= ui
             .add_enabled_ui(enabled, |ui| {
                 egui_commonmark::CommonMarkViewer::new().show_mut(ui, cache, &mut visible)

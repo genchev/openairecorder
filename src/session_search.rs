@@ -11,7 +11,10 @@ pub struct Source {
     pub markdown: String,
     pub is_markdown: bool,
 }
+#[derive(Clone)]
 pub struct Hit {
+    pub source_index: usize,
+    pub occurrence: usize,
     pub source: &'static str,
     pub text: Arc<str>,
     pub range: Range<usize>,
@@ -21,6 +24,7 @@ pub struct Search {
     pub query: String,
     pub index: usize,
     pub hits: Vec<Hit>,
+    pub jump: Option<crate::search_jump::Jump>,
     previous_query: String,
     fingerprint: Option<u64>,
 }
@@ -43,7 +47,7 @@ fn plain(markdown: &str) -> String {
     }
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
-fn ranges(text: &str, query: &str) -> Vec<Range<usize>> {
+pub(crate) fn ranges(text: &str, query: &str) -> Vec<Range<usize>> {
     let query = query
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -84,15 +88,18 @@ impl Search {
         if self.previous_query != self.query {
             self.index = 0;
         }
+        self.jump = None;
         self.hits.clear();
-        for source in sources {
+        for (source_index, source) in sources.iter().enumerate() {
             let text: Arc<str> = if source.is_markdown {
                 plain(&source.markdown).into()
             } else {
                 source.markdown.clone().into()
             };
-            for range in ranges(&text, &self.query) {
+            for (occurrence, range) in ranges(&text, &self.query).into_iter().enumerate() {
                 self.hits.push(Hit {
+                    source_index,
+                    occurrence,
                     source: source.label,
                     text: text.clone(),
                     range,
@@ -103,7 +110,15 @@ impl Search {
         self.previous_query = self.query.clone();
         self.fingerprint = Some(fingerprint);
     }
+    pub fn request_jump(&mut self, now: f64) {
+        self.jump = self
+            .hits
+            .get(self.index)
+            .cloned()
+            .map(|hit| crate::search_jump::Jump::new(hit, now));
+    }
     pub fn step(&mut self, forward: bool) {
+        self.jump = None;
         if !self.hits.is_empty() {
             self.index = if forward {
                 (self.index + 1) % self.hits.len()

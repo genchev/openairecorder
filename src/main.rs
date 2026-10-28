@@ -11,6 +11,7 @@ mod gemini;
 mod overlay;
 #[cfg(windows)]
 mod playback;
+mod search_jump;
 mod secrets;
 mod segments;
 mod session_search;

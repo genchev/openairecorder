@@ -64,9 +64,11 @@ Each bullet or numbered point in **Key Points**, **Decisions**, and **Open Quest
 
 ## Search within a session
 
-The **Overview** and **Transcript** tabs have separate search fields. Overview searches the displayed notes plus session action titles, owners, and due dates, without counting the hidden duplicate checklist. Transcript searches its full text. Matching is case-insensitive and supports Bulgarian. Results show the matching text highlighted in a context excerpt above the original content, with a count and **Previous / Next** controls. Search does not filter or modify the original notes/transcript.
+The **Overview** and **Transcript** tabs have separate search fields. Overview searches the displayed notes plus session action titles, owners, and due dates, without counting the hidden duplicate checklist. Transcript searches its full text. Matching is case-insensitive and supports Bulgarian. Results show the matching text highlighted in a context excerpt above the original content, with a count and **Previous / Next** controls. Click a result excerpt to scroll to that selected occurrence in the original document, with a three-second highlight. Action-item results jump to their row. Previous/Next chooses a result; clicking it performs the jump. Search does not filter or modify the original notes/transcript.
 
 Use **Ctrl+F** to focus the active tab's search, **Enter / Shift+Enter** for next/previous, and **Escape** or **Clear** to reset. Queries remain independent when switching between these tabs and reset on navigation to another view/session. Results update as new recording content arrives. [Overview search](docs/screenshots/overview-search.png) · [Transcript search](docs/screenshots/transcript-search.png), using isolated demo data in the native Linux build.
+
+[Jump within Overview](docs/screenshots/overview-search-jump.png) · [Jump within Transcript](docs/screenshots/transcript-search-jump.png), showing a selected later occurrence in long sample documents.
 
 ## Errors and recovery
 
