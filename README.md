@@ -62,6 +62,12 @@ Gemini is asked to return the current segment's transcript only, plus cumulative
 
 Each bullet or numbered point in **Key Points**, **Decisions**, and **Open Questions** has a small **+** button to create a session Action item. Corresponding Bulgarian headings are supported. The original point stays unchanged; the task is also written as a Markdown checkbox under Action items for storage and export. That duplicate checklist is hidden in the rendered notes when its tasks are already shown in the action panel; it remains in Edit Markdown and exported files. The button becomes a checkmark after creation, and its link to the action survives AI rewording and restarts. Use the existing checkbox or Add to global control to complete/copy the task. Save pending Markdown edits before promoting a point. [Native preview](docs/screenshots/note-point-actions.png), with isolated sample data.
 
+## Search within a session
+
+The **Overview** and **Transcript** tabs have separate search fields. Overview searches the displayed notes plus session action titles, owners, and due dates, without counting the hidden duplicate checklist. Transcript searches its full text. Matching is case-insensitive and supports Bulgarian. Results show the matching text highlighted in a context excerpt above the original content, with a count and **Previous / Next** controls. Search does not filter or modify the original notes/transcript.
+
+Use **Ctrl+F** to focus the active tab's search, **Enter / Shift+Enter** for next/previous, and **Escape** or **Clear** to reset. Queries remain independent when switching between these tabs and reset on navigation to another view/session. Results update as new recording content arrives. [Overview search](docs/screenshots/overview-search.png) · [Transcript search](docs/screenshots/transcript-search.png), using isolated demo data in the native Linux build.
+
 ## Errors and recovery
 
 Quota/rate-limit, transient server, and connection failures get bounded retries. Authentication, unavailable-model, unsupported-output, and other errors retain pending audio and show an actionable message. Update settings and choose **Retry pending audio**. Missing keys stop uploads; adding a key lets you explicitly resume processing. Successful processed chunk files are removed after commit, while the full original audio remains.

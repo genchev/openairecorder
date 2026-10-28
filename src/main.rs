@@ -13,6 +13,7 @@ mod overlay;
 mod playback;
 mod secrets;
 mod segments;
+mod session_search;
 mod tasks;
 mod workspace;
 

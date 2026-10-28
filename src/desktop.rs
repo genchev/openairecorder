@@ -81,6 +81,8 @@ pub struct Desktop {
     permission: bool,
 
     session_tab: usize,
+    overview_search: crate::session_search::Search,
+    transcript_search: crate::session_search::Search,
     markdown_cache: egui_commonmark::CommonMarkCache,
     #[cfg(not(windows))]
     markdown_path: String,
@@ -166,6 +168,8 @@ impl Desktop {
             permission: false,
 
             session_tab: 0,
+            overview_search: Default::default(),
+            transcript_search: Default::default(),
             markdown_cache: egui_commonmark::CommonMarkCache::default(),
             #[cfg(not(windows))]
             markdown_path: String::new(),
@@ -333,6 +337,10 @@ impl Desktop {
             return;
         }
         self.stop_playback();
+        if self.view != view {
+            self.overview_search.clear();
+            self.transcript_search.clear();
+        }
         self.view = view;
         self.session_tab = 0;
         self.output.clear();
@@ -1385,6 +1393,45 @@ impl Desktop {
         ui.add_space(12.0);
         match self.session_tab {
             0 => {
+                document_search(
+                    ui,
+                    ("overview-search", id),
+                    &mut self.overview_search,
+                    "Search this overview…",
+                    || {
+                        let mut notes = r.notes.clone();
+                        let hidden = crate::document::duplicate_action_sections(&notes, |title| {
+                            let title = crate::document::action_title(title);
+                            r.actions
+                                .iter()
+                                .any(|a| crate::document::action_title(&a.title) == title)
+                                || r.note_actions
+                                    .get(&title)
+                                    .is_some_and(|id| r.actions.iter().any(|a| a.id == *id))
+                        });
+                        for range in hidden.into_iter().rev() {
+                            notes.replace_range(range, "");
+                        }
+                        let mut sources = vec![crate::session_search::Source {
+                            label: "Notes",
+                            markdown: notes,
+                            is_markdown: true,
+                        }];
+                        for action in &r.actions {
+                            sources.push(crate::session_search::Source {
+                                label: "Action item",
+                                markdown: format!(
+                                    "{} {} {}",
+                                    action.title,
+                                    action.owner.as_deref().unwrap_or(""),
+                                    action.due.as_deref().unwrap_or("")
+                                ),
+                                is_markdown: false,
+                            });
+                        }
+                        sources
+                    },
+                );
                 let side = ui.available_width() > 790.0;
                 if side {
                     let width = ui.available_width() - 306.0;
@@ -1410,6 +1457,19 @@ impl Desktop {
             }
             1 => self.session_actions(ui, ctx, &r, busy),
             2 => {
+                document_search(
+                    ui,
+                    ("transcript-search", id),
+                    &mut self.transcript_search,
+                    "Search this transcript…",
+                    || {
+                        vec![crate::session_search::Source {
+                            label: "Transcript",
+                            markdown: r.transcript.clone(),
+                            is_markdown: true,
+                        }]
+                    },
+                );
                 design::card(ui).show(ui,|ui|{ui.set_width(ui.available_width());ui.heading("Full transcript");ui.add_space(8.0);if r.transcript.is_empty(){design::subtitle(ui,"Gemini adds each minute here as it is processed. Language is detected automatically.");}else{egui_commonmark::CommonMarkViewer::new().show(ui,&mut self.markdown_cache,&r.transcript);ui.add_space(12.0);if ui.button("Copy transcript").clicked(){ctx.copy_text(r.transcript.clone());}
 if ui.button("Export transcript…").clicked(){self.export(id,false,ctx);}}});
             }
@@ -2079,6 +2139,113 @@ impl Drop for Desktop {
         self.state.overlay.hide();
     }
 }
+fn document_search(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash,
+    search: &mut crate::session_search::Search,
+    hint: &str,
+    sources: impl FnOnce() -> Vec<crate::session_search::Source>,
+) {
+    ui.push_id(id, |ui| {
+        let mut direction = None;
+        ui.horizontal_wrapped(|ui| {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut search.query)
+                    .hint_text(hint)
+                    .desired_width(330.0),
+            );
+            if ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+                response.request_focus();
+                response.scroll_to_me(Some(egui::Align::Min));
+            }
+            if response.changed() && search.query.trim().is_empty() {
+                search.refresh(&[]);
+            }
+            if response.has_focus() || response.lost_focus() {
+                if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                    direction = Some(!ui.input(|input| input.modifiers.shift));
+                    response.request_focus();
+                }
+                if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                    search.clear();
+                    response.surrender_focus();
+                }
+            }
+            if !search.query.trim().is_empty() {
+                search.refresh(&sources());
+                ui.label(if search.hits.is_empty() {
+                    "No matches".into()
+                } else {
+                    format!("{} of {}", search.index + 1, search.hits.len())
+                });
+                if ui
+                    .add_enabled(
+                        !search.hits.is_empty(),
+                        egui::Button::new("Previous").small(),
+                    )
+                    .clicked()
+                {
+                    direction = Some(false);
+                }
+                if ui
+                    .add_enabled(!search.hits.is_empty(), egui::Button::new("Next").small())
+                    .clicked()
+                {
+                    direction = Some(true);
+                }
+                if ui.button("Clear").clicked() {
+                    search.clear();
+                }
+            }
+        });
+        if let Some(forward) = direction {
+            search.step(forward);
+        }
+        if !search.query.trim().is_empty()
+            && let Some(hit) = search.hits.get(search.index)
+        {
+            egui::Frame::new()
+                .fill(design::surface(ui))
+                .stroke(egui::Stroke::new(1.0_f32, ACCENT))
+                .corner_radius(9)
+                .inner_margin(12.0)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    design::eyebrow(ui, &format!("SEARCH RESULT · {}", hit.source));
+                    let (before, matched, after, leading, trailing) = hit.excerpt();
+                    let font = egui::FontId::proportional(14.0);
+                    let color = ui.visuals().text_color();
+                    let normal = egui::TextFormat {
+                        font_id: font.clone(),
+                        color,
+                        ..Default::default()
+                    };
+                    let mut job = egui::text::LayoutJob::default();
+                    if leading {
+                        job.append("…", 0.0, normal.clone());
+                    }
+                    job.append(before, 0.0, normal.clone());
+                    job.append(
+                        matched,
+                        0.0,
+                        egui::TextFormat {
+                            font_id: font,
+                            color: egui::Color32::from_rgb(25, 27, 38),
+                            background: egui::Color32::from_rgb(237, 198, 110),
+                            ..Default::default()
+                        },
+                    );
+                    job.append(after, 0.0, normal.clone());
+                    if trailing {
+                        job.append("…", 0.0, normal);
+                    }
+                    ui.label(job);
+                });
+        }
+        ui.add_space(12.0);
+    });
+}
+
 fn note_markdown(
     ui: &mut egui::Ui,
     cache: &mut egui_commonmark::CommonMarkCache,
